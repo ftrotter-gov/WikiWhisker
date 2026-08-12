@@ -1,0 +1,91 @@
+# =============================================================================
+# WikiWhisker — Dog Breeds Traversal Rules
+# =============================================================================
+#
+# Starting page: "List of dog breeds"
+#
+# This config crawls the "List of dog breeds" Wikipedia article and accepts
+# every linked page that represents an actual dog breed — rejecting list pages,
+# disambiguation pages, and index pages, and requiring the page to belong to
+# at least one of the two key categories: "dog breeds" or "working dogs".
+#
+# An LLM filter is also enabled as a second pass to confirm that each
+# candidate page is about a real, specific (and non-extinct) dog breed.
+#
+# CLI usage:
+#   python wiki_whisker.py "List of dog breeds" \
+#       --traversal-rules   examples/dog_breeds_traversal.yaml \
+#       --extraction-questions examples/dog_breeds_extraction.yaml \
+#       --output results/dog_breeds.json \
+#       --model gpt-4o
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Crawl limits
+# ---------------------------------------------------------------------------
+
+# There are ~500+ distinct dog breed entries linked from the list page.
+# Set high enough to capture all of them.
+max_secondary_pages: 500
+
+# Be polite to the Wikipedia API.
+request_delay_seconds: 0.5
+
+# The "List of dog breeds" page itself is just a navigation page —
+# do not include it in the output records.
+include_starting_pages_in_output: false
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-filters  (fast, no LLM cost)
+# ---------------------------------------------------------------------------
+
+link_filters:
+
+  # Reject disambiguation pages, list pages, and index pages outright.
+  # These are navigation/meta pages, not pages about individual dog breeds.
+  title_not_contains:
+    - "disambiguation"
+    - "list of"
+    - "index of"
+    - "index to"
+
+  # Accept only pages whose Wikipedia categories include at least one of:
+  #   - "dog breeds"    (the primary category for individual breed articles)
+  #   - "working dogs"  (many working/herding/service breed articles use this)
+  #
+  # category_contains is an OR check: a page passes if ANY of its categories
+  # contains ANY of the listed substrings.
+  # This single filter cheaply eliminates non-breed pages (kennels, shows,
+  # organisations, etc.) that happen to be linked from the list page.
+  category_contains:
+    - "dog breeds"
+    - "working dogs"
+
+# ---------------------------------------------------------------------------
+# LLM traversal filter  (runs AFTER the deterministic filters above)
+# ---------------------------------------------------------------------------
+# Each candidate that passed link_filters is checked by the LLM.
+# This catches edge cases the category filter cannot: e.g. ancient/extinct
+# breeds whose Wikipedia pages are categorised differently, or pages about
+# breed groups rather than a single breed.
+
+llm_traversal_filter:
+
+  enabled: true
+
+  prompt: >
+    You are deciding whether a Wikipedia page describes a single, specific,
+    currently-existing (non-extinct) dog breed.
+    Answer YES if ALL of the following are true:
+      1. The page is about one named dog breed (not a group, club, show, or list).
+      2. The breed is not described as extinct, ancient-only, or no longer existing.
+    Answer NO if the page is about an extinct breed, a breed group, a list,
+    a disambiguation page, a kennel club, a dog sport, or any other topic
+    that is not a single living dog breed.
+
+  # Pass the intro paragraph so the LLM can check for extinction language.
+  include_page_summary: true
+
+  # Also pass the category list for extra context (costs one extra API call
+  # per candidate, but helps distinguish breed pages from organisation pages).
+  include_categories: true
