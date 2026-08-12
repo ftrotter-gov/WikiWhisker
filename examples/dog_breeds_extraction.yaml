@@ -8,19 +8,24 @@
 #   Produce a JSON dataset that answers three key questions for every living
 #   dog breed found on Wikipedia's "List of dog breeds" page:
 #
-#     1. health_issues       — Does this breed have notable health problems? (bool)
-#     2. working_dog         — Is this breed a working dog? (bool)
-#     3. family_friendly     — Is this breed family-friendly? (bool)
+#     1. health_issues    — Does this breed have notable health problems?
+#     2. working_dog      — Is this breed a working dog?
+#     3. family_friendly  — Is this breed family-friendly?
 #
-#   If a breed is extinct, all three values are set to null by the LLM
-#   (the traversal filter should already exclude extinct breeds, but the
-#   extraction LLM is also instructed to handle any that slip through).
+# STRUCTURE
+# ─────────
+# This file uses the two-section extraction schema:
+#
+#   questions:        Deterministic fields — resolved from page metadata.
+#                     Zero LLM cost.  Runs instantly.
+#
+#   llm_extraction:   ALL LLM-answered fields, sent in a SINGLE API call
+#                     per page.  The LLM returns one JSON object with all
+#                     answers at once.
 #
 # COST NOTE:
-#   All three key fields use source: "llm".  With up to 500 accepted pages
-#   and 3 LLM fields each, expect up to ~1,500 API calls.
-#   The identity and structured fields (page_title, breed_name, etc.) are
-#   free — they use infobox / Wikidata / Wikipedia metadata.
+#   With up to 500 accepted pages and only ONE LLM batch call per page,
+#   expect ~500 API calls for extraction (vs ~1,500 with per-field calls).
 #
 # CLI usage:
 #   python wiki_whisker.py "List of dog breeds" \
@@ -30,9 +35,11 @@
 #       --model gpt-4o
 # =============================================================================
 
-questions:
+# ---------------------------------------------------------------------------
+# Deterministic fields  (no LLM — fast and free)
+# ---------------------------------------------------------------------------
 
-  # ── Identity fields (free — no LLM cost) ──────────────────────────────────
+questions:
 
   - field_name: page_title
     label: "Wikipedia Page Title"
@@ -50,156 +57,112 @@ questions:
     type: string
     default: null
 
-  # ── Structured fields (infobox / Wikidata — free, no LLM cost) ────────────
 
-  - field_name: country_of_origin
-    label: "Country of Origin"
-    description: "Country where the breed was developed or first recognised."
-    source: "infobox:country"
-    fallback_sources:
-      - "infobox:origin"
-      - "wikidata:P495"   # Wikidata "country of origin" (P495)
-    type: string
-    default: null
+# ---------------------------------------------------------------------------
+# LLM batch extraction  (ONE API call per page — returns all fields at once)
+# ---------------------------------------------------------------------------
+#
+# EXTINCT BREEDS:
+#   The traversal LLM gate is configured to exclude extinct breeds before
+#   extraction begins.  However, if an extinct breed's page passes through
+#   anyway (e.g. because the intro summary was ambiguous), the extraction
+#   prompt below instructs the LLM to return "Unknown" for all three boolean
+#   fields so that null is written to the output rather than a misleading
+#   true/false value.
 
-  - field_name: categories
-    label: "Wikipedia Categories"
-    description: "All Wikipedia categories assigned to this page."
-    source: "category_list"
-    type: list
-    default: []
+llm_extraction:
 
-  # ── LLM-extracted fields ───────────────────────────────────────────────────
-  #
-  # IMPORTANT — EXTINCT BREEDS:
-  #   The traversal LLM filter is configured to exclude extinct breeds before
-  #   extraction begins.  However, if an extinct breed's page passes through
-  #   anyway (e.g. because the intro summary was ambiguous), the extraction
-  #   prompts below instruct the LLM to return "Unknown" for all three boolean
-  #   fields so that null is written to the output rather than a misleading
-  #   true/false value.
-  #
-  # COST REMINDER: each field below costs ONE API call per accepted page.
-  # 3 fields × up to 500 pages = up to 1,500 API calls.
+  prompt_preamble: >
+    Read the Wikipedia article for this dog breed carefully and answer
+    each of the following questions.  Return ONLY a valid JSON object with
+    exactly the keys listed — no extra text, no markdown, no explanation.
 
-  # ── 1. Health issues ───────────────────────────────────────────────────────
+    Important rules that apply to ALL questions:
+      - If the breed is extinct, answer "Unknown" for every question.
+      - Base your answers strictly on what the Wikipedia article states.
+        Do not use outside knowledge beyond what is in the article text.
 
-  - field_name: health_issues
-    label: "Significant Health Issues"
-    description: >
-      True if this dog breed is widely known to have significant, breed-specific
-      health problems that a prospective owner should seriously consider
-      (e.g. hip dysplasia, brachycephalic syndrome, hereditary eye disease,
-      heart defects, or other serious conditions explicitly called out in the
-      Wikipedia article).  False if the breed is described as generally healthy
-      or only minor/common issues are mentioned.  Null if the breed is extinct
-      or health information is entirely absent from the article.
-    source: "llm"
-    llm_prompt: >
-      Read the Wikipedia article for this dog breed carefully.
+  fields:
 
-      Does this breed have significant, breed-specific health problems that a
-      prospective owner should seriously consider?  Examples include (but are
-      not limited to): hip dysplasia, elbow dysplasia, brachycephalic airway
-      syndrome, hereditary eye conditions, serious heart defects, epilepsy,
-      bloat (GDV), or any other serious condition that the article explicitly
-      highlights as a known concern for the breed.
+    # ── 1. Health issues ────────────────────────────────────────────────────
 
-      Rules:
-        - Answer "True" if the article describes one or more significant
-          breed-specific health concerns.
-        - Answer "False" if the breed is described as generally healthy, or
-          only very minor or common-to-all-dogs issues are mentioned.
-        - Answer "Unknown" ONLY if the breed is extinct OR the article contains
-          no health information whatsoever.
+    - field_name: health_issues
+      label: "Significant Health Issues"
+      question: >
+        Does this breed have significant, breed-specific health problems
+        that a prospective owner should seriously consider?
+        Examples include hip dysplasia, elbow dysplasia, brachycephalic
+        airway syndrome, hereditary eye conditions, serious heart defects,
+        epilepsy, bloat (GDV), or any other serious condition that the
+        article explicitly highlights as a known concern for the breed.
+        Answer "True" if one or more significant breed-specific health
+        concerns are described in the article.
+        Answer "False" if the breed is described as generally healthy, or
+        only very minor or common-to-all-dogs issues are mentioned.
+        Answer "Unknown" ONLY if the breed is extinct OR the article
+        contains no health information whatsoever.
+      options:
+        - "True"
+        - "False"
+        - "Unknown"
+      default: "Unknown"
 
-      Respond with exactly one word: True, False, or Unknown.
-    llm_options:
-      - "True"
-      - "False"
-      - "Unknown"
-    type: string
-    default: "Unknown"
+    # ── 2. Working dog ──────────────────────────────────────────────────────
 
-  # ── 2. Working dog ─────────────────────────────────────────────────────────
+    - field_name: working_dog
+      label: "Working Dog"
+      question: >
+        Is this breed a working dog — meaning it was originally bred for,
+        or is today widely used in, a practical working role?
+        Working roles include: herding livestock, guarding property or
+        people, search and rescue, police or military service, pulling
+        sleds, hunting (flushing, tracking, retrieving), or trained
+        assistance/service work.
+        Answer "True" if the article describes the breed as a working,
+        herding, sporting, hound, terrier, or service breed, OR if it is
+        primarily known for a working function rather than companionship.
+        Answer "False" if the breed is primarily described as a companion,
+        toy, lap dog, or show breed with no significant working history.
+        Answer "Unknown" ONLY if the breed is extinct OR the article lacks
+        enough information to make a determination.
+      options:
+        - "True"
+        - "False"
+        - "Unknown"
+      default: "Unknown"
 
-  - field_name: working_dog
-    label: "Working Dog"
-    description: >
-      True if this breed was developed for, or is widely used in, a working
-      role — such as herding, guarding, search and rescue, police or military
-      work, pulling sleds, hunting, or assistance/service work.
-      False if the breed is primarily a companion, toy, or show breed.
-      Null if the breed is extinct or the article does not have enough
-      information to make a determination.
-    source: "llm"
-    llm_prompt: >
-      Read the Wikipedia article for this dog breed carefully.
+    # ── 3. Family-friendly ──────────────────────────────────────────────────
 
-      Is this breed a "working dog" — meaning it was originally bred for, or
-      is today widely used in, a practical working role?  Working roles include:
-      herding livestock, guarding property or people, search and rescue,
-      police or military service, pulling sleds, hunting (flushing, tracking,
-      retrieving), or trained assistance/service work.
-
-      Rules:
-        - Answer "True" if the article describes the breed as a working, herding,
-          sporting, hound, terrier, or service breed, OR if it is primarily
-          known for a working function rather than companionship.
-        - Answer "False" if the breed is primarily described as a companion,
-          toy, lap dog, or show breed with no significant working history.
-        - Answer "Unknown" ONLY if the breed is extinct OR the article lacks
-          enough information to make a determination.
-
-      Respond with exactly one word: True, False, or Unknown.
-    llm_options:
-      - "True"
-      - "False"
-      - "Unknown"
-    type: string
-    default: "Unknown"
-
-  # ── 3. Family-friendly ─────────────────────────────────────────────────────
-
-  - field_name: family_friendly
-    label: "Family-Friendly"
-    description: >
-      True if this breed is generally described as good with children, other
-      pets, and family life — i.e. a suitable choice for a typical family
-      household.  False if the breed requires experienced handling, is known
-      to be aggressive, has a strong prey drive, or is otherwise described as
-      unsuitable for most family environments.  Null if the breed is extinct
-      or the article lacks enough information to make a determination.
-    source: "llm"
-    llm_prompt: >
-      Read the Wikipedia article for this dog breed carefully.
-
-      Is this breed generally considered family-friendly — that is, a good
-      fit for a typical family household, including children and possibly
-      other pets?
-
-      Rules:
-        - Answer "True" if the article describes the breed as good-natured,
-          friendly, gentle, good with children, or otherwise well-suited to
-          family life.
-        - Answer "False" if the article describes the breed as requiring
-          experienced handlers, prone to aggression, dominant, having a
-          strong prey drive toward small animals, or otherwise unsuitable for
-          most family households.
-        - Answer "Unknown" ONLY if the breed is extinct OR the article lacks
-          enough temperament or behavioural information to make a determination.
-
-      Respond with exactly one word: True, False, or Unknown.
-    llm_options:
-      - "True"
-      - "False"
-      - "Unknown"
-    type: string
-    default: "Unknown"
+    - field_name: family_friendly
+      label: "Family-Friendly"
+      question: >
+        Is this breed generally considered family-friendly — a good fit
+        for a typical family household, including children and possibly
+        other pets?
+        Answer "True" if the article describes the breed as good-natured,
+        friendly, gentle, good with children, or otherwise well-suited to
+        family life.
+        Answer "False" if the article describes the breed as requiring
+        experienced handlers, prone to aggression, dominant, having a
+        strong prey drive toward small animals, or otherwise unsuitable
+        for most family households. Any specific mention of problems with biting, aggression, 
+        or poor temperament should be considered a negative indicator.
+        Any breed with a history of being used for fighting (e.g. bull-baiting, dog fighting) 
+        should also be considered a negative indicator. As should any that have specific legislative restrictions 
+        (e.g. banned or restricted in certain countries or regions due to violence).
+        Answer "Unknown" ONLY if the breed is extinct OR the article lacks
+        enough temperament or behavioural information.
+      options:
+        - "True"
+        - "False"
+        - "Unknown"
+      default: "Unknown"
 
 # =============================================================================
 # Sample output record
 # =============================================================================
+#
+# The LLM makes ONE call per page and returns all three answers at once:
 #
 # {
 #   "_page_title":       "Labrador Retriever",

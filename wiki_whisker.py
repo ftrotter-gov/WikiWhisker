@@ -10,6 +10,44 @@ Usage:
         [--model  gpt-4o] \\
         [--cache-dir json_cache] \\
         [--project-id my_project]
+
+EXTRACTION CONFIG SCHEMA
+────────────────────────
+The extraction YAML has two sections:
+
+  questions:         (optional) deterministic fields — title, infobox, wikidata,
+                     category_list.  Zero LLM cost.
+
+  llm_extraction:    (optional) all LLM-answered fields, batched into a SINGLE
+                     API call per page.  The LLM returns one JSON object with
+                     all field values at once.
+
+Example:
+
+  questions:
+    - field_name: page_title
+      source: "title"
+      type: string
+    - field_name: country_of_origin
+      source: "infobox:country"
+      fallback_sources: ["wikidata:P495"]
+      type: string
+      default: null
+
+  llm_extraction:
+    prompt_preamble: >
+      Read the Wikipedia article and answer each question below.
+      Return ONLY a valid JSON object with exactly the keys listed.
+    fields:
+      - field_name: health_issues
+        label: "Significant Health Issues"
+        question: >
+          Does this breed have significant, breed-specific health problems
+          (e.g. hip dysplasia, heart defects, brachycephalic syndrome)?
+          Answer True if yes, False if the breed is generally healthy,
+          Unknown if the breed is extinct or health info is absent.
+        options: ["True", "False", "Unknown"]
+        default: "Unknown"
 """
 
 import argparse
@@ -18,11 +56,24 @@ import json
 import re
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
 import yaml
+
+# Suppress noisy pydantic serialization warnings emitted by older versions of
+# litellm when the openai response model doesn't exactly match the expected
+# schema.  These are harmless version-skew warnings that do not affect results.
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+warnings.filterwarnings("ignore", message=".*PydanticSerialization.*")
+warnings.filterwarnings("ignore", message=".*Expected.*fields.*but got.*")
+
+import os as _os
+# Silence litellm's own verbose logging (it emits INFO lines and triggers the
+# pydantic serializer path that produces the UserWarning above).
+_os.environ.setdefault("LITELLM_LOG", "ERROR")
 
 # litellm is imported lazily inside llm_call() so the tool still works for
 # purely deterministic jobs (infobox / wikidata sources only) even if litellm
@@ -116,21 +167,13 @@ _WIKILINK_RE = re.compile(r"\[\[([^\[\]|#][^\[\]|#]*?)(?:\|[^\[\]]*)?\]\]")
 
 def _strip_noise_sections(wikitext: str) -> str:
     """
-    Remove the content of "noise" sections (References, Bibliography,
-    Further reading, See also, External links, etc.) from wikitext.
-    Returns the wikitext up to the first noise-section heading found.
-    If a noise section appears in the middle of the article, everything
-    from that heading onward is also removed so that subsequent sections
-    (e.g. a "Notes" section followed by "Appendix") are not accidentally
-    included.
+    Remove noise sections (References, See also, External links, etc.).
+    Returns the wikitext up to the first noise-section heading.
     """
     lines = wikitext.splitlines(keepends=True)
     result_lines = []
     for line in lines:
         if _NOISE_SECTION_RE.match(line.rstrip()):
-            # Stop as soon as we hit any noise-section heading.
-            # Wikipedia convention puts these at the end, so we can
-            # safely discard everything from here on.
             break
         result_lines.append(line)
     return "".join(result_lines)
@@ -138,17 +181,8 @@ def _strip_noise_sections(wikitext: str) -> str:
 
 def get_page_links(title: str) -> list[str]:
     """
-    Return internal Wikipedia links from the *body* of a page (namespace 0
-    only), excluding any links that appear in bibliography, references,
-    further-reading, see-also, external-links, notes, or footnotes sections.
-
-    Strategy:
-      1. Fetch the raw wikitext for the page.
-      2. Strip out noise sections (everything from the first noise heading on).
-      3. Parse [[wikilinks]] from the remaining body text.
-      4. Validate each candidate against the Wikipedia API to ensure it exists
-         and lives in namespace 0 (skips redirects to other namespaces,
-         non-existent pages, etc.).  A single batched API call is used.
+    Return internal Wikipedia links from the body of a page (namespace 0 only),
+    excluding noise sections.  Validates each link via the API.
     """
     wikitext = get_page_wikitext(title)
     if not wikitext:
@@ -156,15 +190,12 @@ def get_page_links(title: str) -> list[str]:
 
     body = _strip_noise_sections(wikitext)
 
-    # Extract raw link targets from [[…]] markup in the body.
     raw_targets: list[str] = []
     seen_raw: set[str] = set()
     for m in _WIKILINK_RE.finditer(body):
         target = m.group(1).strip()
-        # Skip file/image/category/template namespaces
         if ":" in target:
             continue
-        # Normalise: first letter capitalised, spaces
         target = target[:1].upper() + target[1:] if target else target
         target = target.replace("_", " ")
         if target and target not in seen_raw:
@@ -174,7 +205,6 @@ def get_page_links(title: str) -> list[str]:
     if not raw_targets:
         return []
 
-    # Validate via the API in batches of 50 (API limit).
     valid_links: list[str] = []
     batch_size = 50
     for i in range(0, len(raw_targets), batch_size):
@@ -182,11 +212,10 @@ def get_page_links(title: str) -> list[str]:
         data = _api_get({
             "action": "query",
             "titles": "|".join(batch),
-            "redirects": "",          # resolve redirects
+            "redirects": "",
         })
         pages = data.get("query", {}).get("pages", [])
         for page in pages:
-            # ns == 0 → article namespace; missing → page doesn't exist
             if page.get("ns") == 0 and not page.get("missing"):
                 valid_links.append(page["title"])
 
@@ -249,10 +278,7 @@ def get_wikidata_entity(title: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def extract_infobox_fields(wikitext: str) -> dict[str, str]:
-    """
-    Parse the first infobox found in wikitext and return a dict of
-    field_name -> raw_value pairs.
-    """
+    """Parse the first infobox and return field_name → raw_value pairs."""
     fields: dict[str, str] = {}
     match = re.search(r"\{\{\s*[Ii]nfobox", wikitext)
     if not match:
@@ -306,7 +332,7 @@ def llm_call(model: str, system_prompt: str, user_message: str) -> str:
     Raises RuntimeError if litellm is not installed or the call fails.
     """
     try:
-        import litellm  # noqa: PLC0415  (lazy import is intentional)
+        import litellm  # noqa: PLC0415
     except ImportError:
         raise RuntimeError(
             "litellm is not installed.  Run:  pip install litellm\n"
@@ -327,6 +353,10 @@ def llm_call(model: str, system_prompt: str, user_message: str) -> str:
         raise RuntimeError(f"LLM call failed: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# Traversal LLM filter  — one YES/NO call per candidate page
+# ---------------------------------------------------------------------------
+
 def llm_traversal_decision(
     title: str,
     prompt: str,
@@ -337,8 +367,8 @@ def llm_traversal_decision(
     categories: Optional[list[str]] = None,
 ) -> bool:
     """
-    Ask the LLM whether this page should be included in the crawl.
-    Returns True for YES, False for NO (or any non-YES response).
+    Ask the LLM a single multi-criteria YES/NO question about a page.
+    Returns True for YES, False for any other response.
     """
     system = (
         "You are a precise Wikipedia page classifier. "
@@ -364,32 +394,62 @@ def llm_traversal_decision(
         return False
 
 
-def llm_extract_field(
+# ---------------------------------------------------------------------------
+# Extraction LLM batch call  — ONE call per page, returns JSON with all fields
+# ---------------------------------------------------------------------------
+
+def llm_batch_extract(
     title: str,
     page_text: str,
-    llm_prompt: str,
-    llm_options: Optional[list[str]],
+    llm_extraction_cfg: dict,
     model: str,
-) -> str:
+) -> dict[str, Any]:
     """
-    Ask the LLM to extract one field value from the page text.
-    Returns the raw string answer from the LLM.
+    Ask the LLM ALL extraction questions for a page in a single API call.
+
+    llm_extraction_cfg has the shape:
+      {
+        "prompt_preamble": "...",   # optional context / instructions
+        "fields": [
+          {
+            "field_name": "health_issues",
+            "question": "Does this breed have significant health problems? ...",
+            "options": ["True", "False", "Unknown"],   # optional
+            "default": "Unknown"
+          },
+          ...
+        ]
+      }
+
+    Returns a dict mapping field_name → extracted value.
+    On JSON parse failure, falls back to the default for each field.
     """
-    if llm_options:
-        options_str = ", ".join(f'"{o}"' for o in llm_options)
-        constraint = (
-            f"You MUST respond with exactly one of these options: {options_str}. "
-            "Do not include any other text, punctuation, or explanation."
-        )
-    else:
-        constraint = (
-            "Respond with a short, direct answer only. "
-            "Do not include any explanation or extra text."
-        )
+    fields = llm_extraction_cfg.get("fields", [])
+    if not fields:
+        return {}
+
+    preamble = llm_extraction_cfg.get("prompt_preamble", "")
+
+    # Build the list of field specs shown to the LLM
+    field_specs = []
+    for f in fields:
+        fn = f.get("field_name", "unknown")
+        q = f.get("question", "")
+        opts = f.get("options")
+        if opts:
+            opts_str = ", ".join(f'"{o}"' for o in opts)
+            field_specs.append(f'"{fn}": {q.strip()}  (must be one of: {opts_str})')
+        else:
+            field_specs.append(f'"{fn}": {q.strip()}')
+
+    field_block = "\n".join(f"  {s}" for s in field_specs)
+    field_keys  = ", ".join(f'"{f.get("field_name", "unknown")}"' for f in fields)
 
     system = (
         "You are a precise data-extraction assistant working with Wikipedia article text. "
-        f"{constraint}"
+        "You will be given article text and a list of questions. "
+        f"You MUST respond with ONLY a valid JSON object containing exactly these keys: {field_keys}. "
+        "Do not include any explanation, markdown formatting, or text outside the JSON object."
     )
 
     # Truncate wikitext to keep costs reasonable
@@ -400,14 +460,70 @@ def llm_extract_field(
     user_msg = (
         f"Wikipedia article: {title}\n\n"
         f"Article text:\n{truncated}\n\n"
-        f"Question: {llm_prompt}"
+        + (f"Instructions: {preamble}\n\n" if preamble else "")
+        + f"Answer each question and return a JSON object:\n{field_block}"
     )
 
     try:
-        return llm_call(model, system, user_msg)
+        raw = llm_call(model, system, user_msg)
     except RuntimeError as exc:
-        print(f"  ⚠  LLM extraction call failed for '{title}': {exc}", file=sys.stderr)
-        return ""
+        print(f"  ⚠  LLM batch extraction call failed for '{title}': {exc}", file=sys.stderr)
+        return {f.get("field_name", "unknown"): f.get("default") for f in fields}
+
+    # Strip markdown code fences if the LLM wrapped the JSON
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw.rstrip())
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to extract the first {...} block
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                parsed = {}
+        else:
+            parsed = {}
+
+    if not parsed:
+        print(
+            f"  ⚠  LLM batch extraction returned non-JSON for '{title}'. "
+            "Using defaults.",
+            file=sys.stderr,
+        )
+
+    # Build result, validating options and applying defaults
+    result: dict[str, Any] = {}
+    for f in fields:
+        fn = f.get("field_name", "unknown")
+        default = f.get("default")
+        opts = f.get("options")
+        raw_val = parsed.get(fn)
+
+        if raw_val is None:
+            result[fn] = default
+            continue
+
+        raw_str = str(raw_val).strip()
+
+        if opts:
+            # Exact match first
+            if raw_str in opts:
+                result[fn] = raw_str
+            else:
+                # Case-insensitive fallback
+                matched = next(
+                    (o for o in opts if o.lower() == raw_str.lower()), None
+                )
+                result[fn] = matched if matched is not None else default
+        else:
+            result[fn] = raw_str
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -418,19 +534,19 @@ def llm_extract_field(
 #
 #   json_cache/
 #     <project_id>/
-#       <safe_title>.json   ← one file per Wikipedia page evaluated
+#       <safe_title>_<hash8>.json   ← one file per Wikipedia page evaluated
 #
-# Each cache file has the structure:
+# Each cache file:
 #
 #   {
 #     "_page_title": "Labrador Retriever",
-#     "_wikipedia_url": "https://en.wikipedia.org/wiki/Labrador_Retriever",
+#     "_wikipedia_url": "...",
 #     "_cache_version": 1,
-#     "_llm_traversal": {          ← present only if LLM traversal was run
+#     "_llm_traversal": {          ← present if LLM traversal was run
 #       "model": "gpt-4o",
-#       "decision": true           ← true = accepted, false = rejected
+#       "decision": true
 #     },
-#     "_extraction": {             ← present only if extraction was completed
+#     "_extraction": {             ← present if extraction was completed
 #       "model": "gpt-4o",
 #       "fields": {                ← key = field_name, value = extracted value
 #         "page_title": "Labrador Retriever",
@@ -442,36 +558,25 @@ def llm_extract_field(
 #
 # RESUMABILITY
 # ────────────
-# • Traversal phase: if "_llm_traversal" is present in the cache for a page,
-#   the cached decision is used instead of making a new LLM call.
-# • Extraction phase: if "_extraction" is present and contains ALL required
-#   field_names, the cached field values are used and no LLM calls are made.
-# • If the model changes between runs, cached LLM results are still reused
-#   (the cache records which model produced each result for auditing).
-#   To force a fresh run with a new model, delete the project cache directory.
+# • Traversal phase: cached decision reused if present.
+# • Extraction phase: cached if ALL required field_names are present.
+# • Model is recorded for auditing but does NOT invalidate the cache.
+#   Delete the project cache directory to force a fresh run with a new model.
 
 CACHE_VERSION = 1
 
 
 def _title_to_cache_filename(title: str) -> str:
-    """
-    Convert a Wikipedia page title to a safe filename for the cache.
-    Uses the title with filesystem-unsafe chars replaced, plus a short
-    hash suffix to avoid collisions on long or unusual titles.
-    """
     safe = re.sub(r'[^\w\-. ]', '_', title).strip().replace(' ', '_')
-    # Truncate to 80 chars and append an 8-char hash to guarantee uniqueness
     short_hash = hashlib.md5(title.encode("utf-8")).hexdigest()[:8]
     return f"{safe[:80]}_{short_hash}.json"
 
 
 def _get_cache_path(cache_dir: Path, project_id: str, title: str) -> Path:
-    """Return the Path for the cache file for a given page title."""
     return cache_dir / project_id / _title_to_cache_filename(title)
 
 
 def _load_cache(cache_path: Path) -> dict:
-    """Load the cache JSON for a page, or return an empty dict if not present."""
     if cache_path.exists():
         try:
             with cache_path.open("r", encoding="utf-8") as fh:
@@ -484,7 +589,6 @@ def _load_cache(cache_path: Path) -> dict:
 def _save_cache(cache_path: Path, data: dict) -> None:
     """Atomically write the cache JSON for a page."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write to a temp file then rename for atomicity
     tmp = cache_path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -492,14 +596,8 @@ def _save_cache(cache_path: Path, data: dict) -> None:
 
 
 def _derive_project_id(output_path: str) -> str:
-    """
-    Derive a project ID from the output path.
-    e.g. "results/dog_breeds.json" → "dog_breeds"
-         "output.json"             → "output"
-    """
-    stem = Path(output_path).stem          # filename without extension
-    # Replace non-alphanumeric chars with underscores for a clean directory name
-    return re.sub(r'[^\w]', '_', stem).strip('_') or "wikwhisker_project"
+    stem = Path(output_path).stem
+    return re.sub(r'[^\w]', '_', stem).strip('_') or "wikiwhisker_project"
 
 
 # ---------------------------------------------------------------------------
@@ -507,10 +605,7 @@ def _derive_project_id(output_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def page_passes_deterministic_filters(title: str, rules: dict) -> bool:
-    """
-    Return True if `title` passes ALL deterministic link_filters.
-    Does not call the LLM.
-    """
+    """Return True if title passes ALL deterministic link_filters."""
     filters = rules.get("link_filters", {})
     if not filters:
         return True
@@ -558,11 +653,9 @@ def page_passes_llm_filter(
     project_id: str = "",
 ) -> bool:
     """
-    If llm_traversal_filter is enabled in `rules`, ask the LLM whether this
-    page should be included.  Returns True if the filter is disabled.
-
-    If cache_dir and project_id are provided, the LLM decision is cached on
-    disk and reused on subsequent runs (resumability).
+    Ask the LLM a single YES/NO gate question about the page.
+    Returns True if the filter is disabled or if the LLM says YES.
+    Caches the decision for resumability.
     """
     llm_cfg = rules.get("llm_traversal_filter", {})
     if not llm_cfg.get("enabled", False):
@@ -571,7 +664,7 @@ def page_passes_llm_filter(
     prompt = llm_cfg.get("prompt", "")
     if not prompt:
         print(
-            "  ⚠  llm_traversal_filter.enabled is true but no prompt is set — skipping LLM filter.",
+            "  ⚠  llm_traversal_filter.enabled is true but no prompt is set — skipping.",
             file=sys.stderr,
         )
         return True
@@ -585,9 +678,9 @@ def page_passes_llm_filter(
         if "_llm_traversal" in cache_data:
             cached = cache_data["_llm_traversal"]
             decision = cached.get("decision", False)
+            status = "accepted" if decision else "rejected"
             print(
-                f"     ↩  LLM traversal cached ({'YES' if decision else 'NO'}) "
-                f"for '{title}' [model={cached.get('model', '?')}]",
+                f"     ↩  Page {status} (cached) '{title}' [model={cached.get('model', '?')}]",
                 flush=True,
             )
             return decision
@@ -616,7 +709,6 @@ def page_passes_llm_filter(
 
     # ── Write to cache ───────────────────────────────────────────────────────
     if cache_path is not None:
-        # Preserve any existing extraction data in the cache file
         cache_data.setdefault("_page_title", title)
         cache_data.setdefault("_wikipedia_url",
             "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"))
@@ -631,27 +723,24 @@ def page_passes_llm_filter(
 
 
 # ---------------------------------------------------------------------------
-# Extraction question evaluation  (cache-aware)
+# Deterministic field extraction  (infobox / wikidata / title / category_list)
 # ---------------------------------------------------------------------------
 
-def _resolve_source(
+def _resolve_deterministic_source(
     title: str,
     source: str,
     wikitext: Optional[str],
     infobox: dict,
     entity: Optional[dict],
-    question_def: dict,
-    model: str,
 ) -> Any:
     """
-    Fetch the raw value of a field from the given source.
+    Resolve a single deterministic source (no LLM).
 
     source values:
       "title"                  — page title itself
       "category_list"          — full list of categories
       "infobox:<field_name>"   — field from the page infobox
       "wikidata:<property_id>" — Wikidata property (e.g. "P31")
-      "llm"                    — ask the LLM using question_def["llm_prompt"]
     """
     if source == "title":
         return title
@@ -694,47 +783,19 @@ def _resolve_source(
             return None
         return values[0] if len(values) == 1 else values
 
-    if source == "llm":
-        llm_prompt = question_def.get("llm_prompt", "")
-        if not llm_prompt:
-            print(
-                f"  ⚠  source is 'llm' but no llm_prompt set for field "
-                f"'{question_def.get('field_name', '?')}' — returning None.",
-                file=sys.stderr,
-            )
-            return None
-        llm_options = question_def.get("llm_options")
-        page_text = wikitext or ""
-        answer = llm_extract_field(
-            title=title,
-            page_text=page_text,
-            llm_prompt=llm_prompt,
-            llm_options=llm_options,
-            model=model,
-        )
-        # Validate against options if provided
-        if llm_options and answer not in llm_options:
-            # Try case-insensitive match
-            for opt in llm_options:
-                if opt.lower() == answer.lower():
-                    return opt
-            # If still no match, return raw answer (don't silently drop it)
-        return answer if answer else None
-
     return None
 
 
-def answer_extraction_question(
+def resolve_deterministic_field(
     title: str,
     question_def: dict,
     wikitext: Optional[str],
     infobox: dict,
     entity: Optional[dict],
-    model: str,
 ) -> Any:
     """
-    Evaluate one extraction question definition and return the extracted value.
-    Tries primary source first, then fallback_sources in order, then default.
+    Evaluate one deterministic extraction question and return the value.
+    Tries primary source, then fallback_sources, then returns default.
     """
     sources = [question_def.get("source", "title")]
     fallbacks = question_def.get("fallback_sources", [])
@@ -742,7 +803,7 @@ def answer_extraction_question(
 
     raw = None
     for src in sources:
-        val = _resolve_source(title, src, wikitext, infobox, entity, question_def, model)
+        val = _resolve_deterministic_source(title, src, wikitext, infobox, entity)
         if val is not None and val != "" and val != []:
             raw = val
             break
@@ -753,9 +814,7 @@ def answer_extraction_question(
     target_type = question_def.get("type", "string")
     try:
         if target_type == "list":
-            if isinstance(raw, list):
-                return raw
-            return [raw]
+            return raw if isinstance(raw, list) else [raw]
         elif target_type == "int":
             return int(str(raw).replace(",", "").strip())
         elif target_type == "float":
@@ -771,31 +830,43 @@ def answer_extraction_question(
 
 
 # ---------------------------------------------------------------------------
-# Per-page record builder  (cache-aware)
+# Per-page record builder  (cache-aware, batch LLM extraction)
 # ---------------------------------------------------------------------------
 
 def build_page_record(
     title: str,
     questions: list[dict],
+    llm_extraction_cfg: Optional[dict],
     model: str,
     include_metadata: bool = True,
     cache_dir: Optional[Path] = None,
     project_id: str = "",
 ) -> dict:
     """
-    Fetch data for a single page and build a JSON-serialisable record
-    according to the extraction questions definition.
+    Fetch data for a single page and build a JSON-serialisable record.
 
-    If cache_dir and project_id are given, already-extracted fields are loaded
-    from the per-page cache file and LLM calls are skipped for those fields.
-    After extraction the full record is written back to the cache.
+    - questions: list of deterministic field definitions (title/infobox/wikidata)
+    - llm_extraction_cfg: the llm_extraction block (or None if absent)
+
+    Cache behaviour:
+      If all required field_names are present in the cache, the cached values
+      are returned and no LLM (or Wikipedia API) calls are made for that page.
     """
-    # ── Cache check — is this page already fully extracted? ──────────────────
-    cache_path: Optional[Path] = None
-    cache_data: dict = {}
-    required_field_names = {
+    # Collect all required field names
+    det_field_names = {
         q.get("field_name") or q.get("label", "unknown") for q in questions
     }
+    llm_field_names: set[str] = set()
+    if llm_extraction_cfg:
+        for f in llm_extraction_cfg.get("fields", []):
+            fn = f.get("field_name", "unknown")
+            llm_field_names.add(fn)
+
+    all_required_field_names = det_field_names | llm_field_names
+
+    # ── Cache check ──────────────────────────────────────────────────────────
+    cache_path: Optional[Path] = None
+    cache_data: dict = {}
 
     if cache_dir and project_id:
         cache_path = _get_cache_path(cache_dir, project_id, title)
@@ -803,9 +874,12 @@ def build_page_record(
         extraction_cache = cache_data.get("_extraction", {})
         cached_fields = extraction_cache.get("fields", {})
 
-        if required_field_names and required_field_names.issubset(cached_fields.keys()):
-            # All fields are already in the cache — reconstruct the record directly
-            print(f"  ↩  Extraction cached for '{title}' [model={extraction_cache.get('model', '?')}]", flush=True)
+        if all_required_field_names and all_required_field_names.issubset(cached_fields.keys()):
+            print(
+                f"  ↩  Extraction cached for '{title}' "
+                f"[model={extraction_cache.get('model', '?')}]",
+                flush=True,
+            )
             record: dict = {}
             if include_metadata:
                 record["_page_title"] = title
@@ -814,17 +888,21 @@ def build_page_record(
                 )
             for q in questions:
                 fn = q.get("field_name") or q.get("label", "unknown")
-                record[fn] = cached_fields[fn]
+                record[fn] = cached_fields.get(fn)
+            if llm_extraction_cfg:
+                for f in llm_extraction_cfg.get("fields", []):
+                    fn = f.get("field_name", "unknown")
+                    record[fn] = cached_fields.get(fn)
             return record
 
-    # ── Fresh extraction ─────────────────────────────────────────────────────
-    print(f"  → Fetching page: {title}", flush=True)
+    # ── Fresh fetch ──────────────────────────────────────────────────────────
+    print(f"  → Processing page: '{title}'", flush=True)
 
     wikitext = get_page_wikitext(title)
     infobox = extract_infobox_fields(wikitext) if wikitext else {}
     entity = None
 
-    # Lazily fetch Wikidata entity only if a wikidata: source is needed
+    # Lazily fetch Wikidata only if needed
     for q in questions:
         all_sources = [q.get("source", "")] + q.get("fallback_sources", [])
         if any(s.startswith("wikidata:") for s in all_sources):
@@ -832,7 +910,6 @@ def build_page_record(
             break
 
     record = {}
-
     if include_metadata:
         record["_page_title"] = title
         record["_wikipedia_url"] = (
@@ -840,15 +917,36 @@ def build_page_record(
         )
 
     extracted_fields: dict = {}
+
+    # ── Deterministic fields ─────────────────────────────────────────────────
     for q in questions:
         field_name = q.get("field_name") or q.get("label", "unknown")
-        value = answer_extraction_question(
-            title, q, wikitext, infobox, entity, model
-        )
+        value = resolve_deterministic_field(title, q, wikitext, infobox, entity)
         record[field_name] = value
         extracted_fields[field_name] = value
 
-    # ── Write extraction results to cache ────────────────────────────────────
+    # ── LLM batch extraction (one call for ALL llm fields) ───────────────────
+    if llm_extraction_cfg and llm_extraction_cfg.get("fields"):
+        llm_fields = llm_extraction_cfg.get("fields", [])
+        llm_results = llm_batch_extract(
+            title=title,
+            page_text=wikitext or "",
+            llm_extraction_cfg=llm_extraction_cfg,
+            model=model,
+        )
+        # Log all field answers on a single line
+        answers_str = ", ".join(
+            f"{f.get('field_name', '?')}={llm_results.get(f.get('field_name', '?'), '?')!r}"
+            for f in llm_fields
+        )
+        print(f"     ✎  {answers_str}", flush=True)
+
+        for f in llm_fields:
+            fn = f.get("field_name", "unknown")
+            record[fn] = llm_results.get(fn)
+            extracted_fields[fn] = llm_results.get(fn)
+
+    # ── Write to cache ───────────────────────────────────────────────────────
     if cache_path is not None:
         cache_data.setdefault("_page_title", title)
         cache_data.setdefault("_wikipedia_url",
@@ -870,7 +968,8 @@ def build_page_record(
 def run_crawl(
     starting_pages: list[str],
     traversal_rules: dict,
-    extraction_questions: list[dict],
+    questions: list[dict],
+    llm_extraction_cfg: Optional[dict],
     output_path: str,
     model: str,
     cache_dir: Optional[Path] = None,
@@ -882,22 +981,15 @@ def run_crawl(
     Crawl flow:
       [1] Resolve starting page titles
       [2] Collect all internal links from starting pages
-      [3] Apply deterministic filters, then optional LLM filter
-      [4] Extract data from accepted pages
+      [3] Apply deterministic filters, then optional LLM gate filter
+      [4] Extract data from accepted pages (deterministic + batch LLM)
       [5] Write structured JSON output
-
-    Cache / resumability:
-      LLM traversal decisions and extracted field values are cached in
-      json_cache/<project_id>/<page>.json so that interrupted runs can be
-      resumed without repeating expensive LLM API calls.
     """
     max_pages = traversal_rules.get("max_secondary_pages", 200)
     delay = traversal_rules.get("request_delay_seconds", 0.5)
     include_starting_pages = traversal_rules.get("include_starting_pages_in_output", False)
-
     llm_filter_enabled = traversal_rules.get("llm_traversal_filter", {}).get("enabled", False)
 
-    # Announce cache directory in use
     if cache_dir and project_id:
         project_cache = cache_dir / project_id
         project_cache.mkdir(parents=True, exist_ok=True)
@@ -921,106 +1013,135 @@ def run_crawl(
                 candidate_links.append(link)
         time.sleep(delay)
 
-    # ── [3] Apply filters ─────────────────────────────────────────────────────
+    # ── [3+4] Gate filter + extract — pipelined per page ─────────────────────
+    #
+    # Rather than running all gate checks first and then all extractions,
+    # we process each candidate page end-to-end in one pass:
+    #   1. Deterministic filter (free, instant)
+    #   2. LLM gate check (one YES/NO call, cached)
+    #   3. If accepted: extract + write output immediately
+    #
+    # This means extraction starts on the very first accepted page and the
+    # output file is always up-to-date.  Interrupting the script at any point
+    # leaves a valid, partially-complete output file and a cache that allows
+    # a full resume without repeating any work.
+
     filter_label = (
-        "deterministic + LLM filters" if llm_filter_enabled else "deterministic filters"
+        "gate + extract pipeline" if llm_filter_enabled else "filter + extract pipeline"
     )
-    print(f"\n[2/3] Applying {filter_label}…", flush=True)
+    print(f"\n[2/2] Running {filter_label}…", flush=True)
 
-    accepted: list[str] = []
-    for link in candidate_links:
-        if len(accepted) >= max_pages:
-            print(
-                f"  ⚠  max_secondary_pages ({max_pages}) reached — stopping filter pass.",
-                flush=True,
-            )
-            break
+    # Build the output schema once (used in every incremental write)
+    all_field_defs = []
+    for q in questions:
+        all_field_defs.append({
+            "field_name": q.get("field_name") or q.get("label", "unknown"),
+            "label": q.get("label", ""),
+            "type": q.get("type", "string"),
+            "source": q.get("source", ""),
+            "description": q.get("description", ""),
+            "llm": False,
+        })
+    if llm_extraction_cfg:
+        for f in llm_extraction_cfg.get("fields", []):
+            all_field_defs.append({
+                "field_name": f.get("field_name", "unknown"),
+                "label": f.get("label", f.get("field_name", "unknown")),
+                "type": "string",
+                "source": "llm_batch",
+                "description": f.get("question", ""),
+                "llm": True,
+                "options": f.get("options"),
+            })
 
-        # Step A: cheap deterministic filters (never cached — instantaneous)
-        if not page_passes_deterministic_filters(link, traversal_rules):
-            continue
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Step B: optional LLM filter (cache-aware)
-        if llm_filter_enabled:
-            # Only print the "asking" line if it won't be served from cache
-            cache_path_check = None
-            if cache_dir and project_id:
-                cache_path_check = _get_cache_path(cache_dir, project_id, link)
-                if not (_load_cache(cache_path_check).get("_llm_traversal")):
-                    print(f"     LLM filter: asking about '{link}'…", flush=True)
-            else:
-                print(f"     LLM filter: asking about '{link}'…", flush=True)
+    def _write_output(records: list[dict]) -> None:
+        """Atomically write the current records to the output JSON file."""
+        payload = {
+            "meta": {
+                "tool": "WikiWhisker",
+                "version": "1.0",
+                "model": model,
+                "starting_pages": starting_titles,
+                "total_records": len(records),
+                "cache_dir": str(cache_dir / project_id) if (cache_dir and project_id) else None,
+                "output_schema": {
+                    "schema_version": "1.0",
+                    "fields": all_field_defs,
+                },
+            },
+            "records": records,
+        }
+        tmp = out_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        tmp.replace(out_path)
 
-            if not page_passes_llm_filter(
-                link, traversal_rules, model,
-                cache_dir=cache_dir, project_id=project_id,
-            ):
-                print(f"     ✗ LLM says NO for '{link}'", flush=True)
-                time.sleep(delay)
-                continue
-            print(f"     ✓ LLM says YES for '{link}'", flush=True)
-
-        accepted.append(link)
-        time.sleep(delay)
-
-    print(f"  → {len(accepted)} pages accepted.", flush=True)
-
-    # ── [4] Extract data ──────────────────────────────────────────────────────
-    print("\n[3/3] Extracting data from accepted pages…", flush=True)
     records: list[dict] = []
+    accepted_count = 0
 
+    # Optionally include starting pages first
     if include_starting_pages:
         for start_title in starting_titles:
             rec = build_page_record(
-                start_title, extraction_questions, model,
+                start_title, questions, llm_extraction_cfg, model,
                 cache_dir=cache_dir, project_id=project_id,
             )
             rec["_is_starting_page"] = True
             records.append(rec)
+            _write_output(records)
             time.sleep(delay)
 
-    for title in accepted:
+    # Main pipeline loop: one candidate at a time, gate → extract → save
+    for link in candidate_links:
+        if accepted_count >= max_pages:
+            print(
+                f"  ⚠  max_secondary_pages ({max_pages}) reached — stopping.",
+                flush=True,
+            )
+            break
+
+        # Step A: cheap deterministic filters (no LLM, no cost)
+        if not page_passes_deterministic_filters(link, traversal_rules):
+            continue
+
+        # Step B: optional LLM gate filter (cache-aware, one YES/NO call)
+        if llm_filter_enabled:
+            is_cached = False
+            if cache_dir and project_id:
+                cp = _get_cache_path(cache_dir, project_id, link)
+                is_cached = bool(_load_cache(cp).get("_llm_traversal"))
+
+            if not is_cached:
+                print(f"     Gate check: '{link}'…", flush=True)
+
+            passed = page_passes_llm_filter(
+                link, traversal_rules, model,
+                cache_dir=cache_dir, project_id=project_id,
+            )
+            if not passed:
+                if not is_cached:
+                    print(f"     ✗ Page rejected: '{link}'", flush=True)
+                time.sleep(delay)
+                continue
+            if not is_cached:
+                print(f"     ✓ Page accepted: '{link}' — extracting…", flush=True)
+
+        # Step C: extract immediately and write to disk
+        accepted_count += 1
         rec = build_page_record(
-            title, extraction_questions, model,
+            link, questions, llm_extraction_cfg, model,
             cache_dir=cache_dir, project_id=project_id,
         )
         rec["_is_starting_page"] = False
         records.append(rec)
+        _write_output(records)
+        print(f"     [{accepted_count}/{max_pages}] saved '{link}' → {output_path}", flush=True)
         time.sleep(delay)
 
-    # ── [5] Build output JSON ─────────────────────────────────────────────────
-    output_schema = {
-        "schema_version": "1.0",
-        "fields": [
-            {
-                "field_name": q.get("field_name") or q.get("label", "unknown"),
-                "label": q.get("label", ""),
-                "type": q.get("type", "string"),
-                "source": q.get("source", ""),
-                "description": q.get("description", ""),
-            }
-            for q in extraction_questions
-        ],
-    }
-
-    output = {
-        "meta": {
-            "tool": "WikiWhisker",
-            "version": "1.0",
-            "model": model,
-            "starting_pages": starting_titles,
-            "total_records": len(records),
-            "cache_dir": str(cache_dir / project_id) if (cache_dir and project_id) else None,
-            "output_schema": output_schema,
-        },
-        "records": records,
-    }
-
-    out_path = Path(output_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as fh:
-        json.dump(output, fh, indent=2, ensure_ascii=False)
-
+    # ── Final confirmation ────────────────────────────────────────────────────
     print(f"\n✅  Done!  {len(records)} records written to {output_path}", flush=True)
 
 
@@ -1034,16 +1155,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         description=(
             "WikiWhisker — crawl a structured subset of Wikipedia pages and\n"
             "extract data into a structured JSON file.\n\n"
-            "Provide one or more starting Wikipedia page titles or URLs, a YAML\n"
-            "file (under config/) defining which linked pages to follow, and a\n"
-            "YAML file (under config/) defining what data to extract from each\n"
-            "page.  The results are written as structured JSON.\n\n"
-            "LLM calls use the OpenAI ChatGPT API by default (gpt-4o).  Set\n"
-            "OPENAI_API_KEY in your environment (copy .env.example to .env).\n"
-            "Pass --model to switch to any litellm-supported model.\n\n"
-            "RESUMABILITY: LLM traversal decisions and extracted field values\n"
-            "are cached in json_cache/<project_id>/ so interrupted runs can\n"
-            "be restarted without repeating expensive API calls."
+            "EXTRACTION: Two optional sections in the extraction YAML:\n"
+            "  questions:       deterministic fields (title/infobox/wikidata) — free\n"
+            "  llm_extraction:  ALL LLM fields batched into ONE API call per page\n\n"
+            "TRAVERSAL GATE: llm_traversal_filter in the traversal YAML sends ONE\n"
+            "YES/NO call per candidate page (multi-criteria prompt is fine).\n\n"
+            "RESUMABILITY: Results cached in json_cache/<project_id>/ so interrupted\n"
+            "runs can restart without repeating API calls."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1057,85 +1175,56 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "Example: 'Aspirin' or 'https://en.wikipedia.org/wiki/Aspirin'"
         ),
     )
-
     parser.add_argument(
         "--traversal-rules",
         metavar="TRAVERSAL_YAML",
         required=True,
-        help=(
-            "Path to the YAML file defining link-following rules. "
-            "Lives under config/ by convention. "
-            "See examples/traversal_rules_example.yaml for the full schema."
-        ),
+        help="Path to the YAML file defining link-following rules.",
     )
-
     parser.add_argument(
         "--extraction-questions",
         metavar="EXTRACTION_YAML",
         required=True,
-        help=(
-            "Path to the YAML file defining what data to extract and how to "
-            "structure the output JSON. "
-            "Lives under config/ by convention. "
-            "See examples/extraction_questions_example.yaml for the full schema."
-        ),
+        help="Path to the YAML file defining what data to extract.",
     )
-
     parser.add_argument(
         "--output",
         metavar="OUTPUT_JSON",
         default="output.json",
-        help=(
-            "Path for the output JSON file. Default: output.json. "
-            "Recommended: results/<name>.json"
-        ),
+        help="Path for the output JSON file. Default: output.json.",
     )
-
     parser.add_argument(
         "--model",
         metavar="MODEL",
         default="gpt-4o",
         help=(
-            "litellm model string for LLM calls. Default: gpt-4o. "
-            "Examples: gpt-4o-mini, claude-3-5-sonnet-20241022, ollama/llama3. "
-            "Only needed when traversal or extraction uses LLM sources/filters."
+            "litellm model string. Default: gpt-4o. "
+            "Examples: gpt-4o-mini, claude-3-5-sonnet-20241022, ollama/llama3."
         ),
     )
-
     parser.add_argument(
         "--cache-dir",
         metavar="CACHE_DIR",
         default="json_cache",
         help=(
-            "Root directory for the per-project JSON cache. "
-            "Default: json_cache  (relative to current working directory). "
-            "Each project gets its own sub-directory: <cache-dir>/<project-id>/. "
-            "Pass an empty string or 'none' to disable caching entirely."
+            "Root directory for per-project JSON cache. Default: json_cache. "
+            "Pass 'none' to disable caching."
         ),
     )
-
     parser.add_argument(
         "--project-id",
         metavar="PROJECT_ID",
         default="",
         help=(
-            "Identifier for this crawl project.  Used as the sub-directory name "
-            "inside --cache-dir.  Default: derived from the --output filename stem "
-            "(e.g. 'results/dog_breeds.json' → project-id 'dog_breeds'). "
-            "Set explicitly to share a cache across multiple output files, or to "
-            "use a descriptive name."
+            "Project sub-directory inside --cache-dir. "
+            "Default: derived from --output filename stem."
         ),
     )
-
     parser.add_argument(
         "--no-cache",
         action="store_true",
         default=False,
-        help=(
-            "Disable the JSON cache entirely for this run.  All LLM calls will be "
-            "made fresh and nothing will be read from or written to disk.  "
-            "Equivalent to passing --cache-dir none."
-        ),
+        help="Disable the JSON cache entirely for this run.",
     )
 
     return parser.parse_args(argv)
@@ -1163,20 +1252,24 @@ def main(argv: Optional[list[str]] = None) -> None:
     traversal_rules = load_yaml_file(args.traversal_rules, "traversal rules")
     extraction_config = load_yaml_file(args.extraction_questions, "extraction questions")
 
+    # Support both bare list and dict-with-questions wrapper
     if isinstance(extraction_config, list):
-        extraction_questions = extraction_config
+        questions = extraction_config
+        llm_extraction_cfg = None
     elif isinstance(extraction_config, dict):
-        extraction_questions = extraction_config.get("questions", [])
+        questions = extraction_config.get("questions", [])
+        llm_extraction_cfg = extraction_config.get("llm_extraction") or None
     else:
         print(
-            "ERROR: extraction questions YAML must be a list or a dict with a 'questions' key.",
+            "ERROR: extraction questions YAML must be a list or a dict.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    if not extraction_questions:
+    if not questions and not llm_extraction_cfg:
         print(
-            "ERROR: No extraction questions found in the extraction questions YAML.",
+            "ERROR: No extraction questions found. "
+            "Add a 'questions:' section and/or a 'llm_extraction:' section.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1201,7 +1294,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     run_crawl(
         starting_pages=args.starting_pages,
         traversal_rules=traversal_rules,
-        extraction_questions=extraction_questions,
+        questions=questions,
+        llm_extraction_cfg=llm_extraction_cfg,
         output_path=args.output,
         model=args.model,
         cache_dir=cache_dir,

@@ -7,22 +7,37 @@
 #
 # RELATIONSHIP TO THE TRAVERSAL FILE
 # ────────────────────────────────────
-# The traversal rules YAML (the other config file) controls WHICH Wikipedia
-# pages are visited.  This file controls WHAT is extracted from each of them.
+# The traversal rules YAML controls WHICH Wikipedia pages are visited.
+# This file controls WHAT is extracted from each of them.
 # Both files are required to run WikiWhisker.
 #
-# QUICK START — the simplest possible extraction config is just one field:
+# TWO-SECTION SCHEMA
+# ───────────────────
+# This file has two optional top-level sections:
+#
+#   questions:
+#     Deterministic fields — resolved from page metadata (title, infobox,
+#     Wikidata, category list).  Zero LLM cost.  Instant.
+#
+#   llm_extraction:
+#     LLM-answered fields.  ALL fields in this section are batched into a
+#     SINGLE API call per page.  The LLM reads the article text once and
+#     returns a JSON object with all the answers at once.
+#     Cost: ONE API call per accepted page (regardless of how many fields).
+#
+# You can use either or both sections.  A config with only deterministic
+# fields is entirely free.  A config with only llm_extraction still makes
+# exactly one LLM call per page.
+#
+# QUICK START — simplest possible extraction config:
 #
 #   questions:
 #     - field_name: page_title
 #       source: "title"
 #       type: string
 #
-# That gives you one field per record: the Wikipedia page title.
-# Add more fields under "questions:" as needed.
-#
 # LOCATION: copy this file to  config/<name>_extraction.yaml  and edit it.
-# The config/ directory is git-ignored by default; examples/ is tracked.
+# The config/ directory is git-ignored; examples/ is tracked.
 #
 # CLI usage:
 #   python wiki_whisker.py "List of dog breeds" \
@@ -32,7 +47,7 @@
 #       --model gpt-4o
 #
 # =============================================================================
-# Field definition keys
+# DETERMINISTIC FIELD KEYS  (used in the "questions:" section)
 # =============================================================================
 #
 #   field_name   (required)
@@ -43,7 +58,7 @@
 #       Human-readable display name.  Appears in output JSON meta.output_schema.
 #
 #   description  (optional)
-#       Prose description.  Passed as context to the LLM when source is "llm".
+#       Prose description of what this field contains.
 #
 #   source       (required)
 #       Where to read the value.  One of:
@@ -58,50 +73,28 @@
 #         "infobox:<field_name>"
 #             Named parameter from the page's first Infobox template.
 #             e.g.  source: "infobox:birth_date"
-#             Field names are case-sensitive; match the infobox parameter name
-#             exactly.
+#             Field names are case-sensitive; match the infobox parameter
+#             name exactly (see HOW TO FIND INFOBOX FIELD NAMES below).
 #
 #             HOW TO FIND INFOBOX FIELD NAMES FOR ANY WIKIPEDIA PAGE:
 #               1. Open the Wikipedia article in your browser.
 #               2. Click "Edit" (or "Edit source") at the top of the page.
 #               3. Look for a block starting with  {{Infobox ...
-#               4. The parameter names inside (e.g. |name=, |country=) are the
-#                  field names.  Use them exactly as written — they are case-
-#                  sensitive, and different pages may use different names for
-#                  similar concepts (e.g. "country" vs. "origin" vs. "Country").
-#               5. Use fallback_sources (see below) to handle variations.
+#               4. The parameter names inside (e.g. |name=, |country=) are
+#                  the field names.  Use them exactly as written (case-sensitive).
+#               5. Use fallback_sources to handle variations (e.g. "name" vs "Name").
 #
 #         "wikidata:<property_id>"
 #             Wikidata property on the item linked to this page.
 #             e.g.  source: "wikidata:P31"   (instance of)
 #                   source: "wikidata:P495"  (country of origin)
-#             Multiple values: first returned for scalar types;
-#             all returned for  type: list.
-#
-#             Wikidata values are returned as Q-IDs (e.g. Q39367).  Q-IDs are
-#             Wikidata's unique identifiers for concepts.  You can look up any
-#             Q-ID at  https://www.wikidata.org/wiki/<Q-ID>
-#             (e.g. https://www.wikidata.org/wiki/Q39367 = "dog breed").
-#             See docs/schema_reference.md for a list of common property IDs.
-#
-#         "llm"
-#             Ask the LLM the question in  llm_prompt  about the page text.
-#             Requires  llm_prompt  to be set.
-#             Uses the model specified by  --model  (default: gpt-4o).
-#             Requires OPENAI_API_KEY in environment (or relevant provider key).
-#
-#             COST: Each "source: llm" field makes ONE API call per accepted page.
-#             Example: 5 LLM fields × 200 pages = 1,000 API calls.
-#             Where possible, prefer  source: "infobox:..."  or
-#             source: "wikidata:..."  (both are free — no API calls).
-#             Use "llm" only for things that can't be read from structured data.
+#             Values are returned as Q-IDs (e.g. Q39367 = "dog breed").
+#             See docs/schema_reference.md for common property IDs.
 #
 #   fallback_sources  (optional)
 #       Ordered list of additional sources tried when the primary source
 #       returns empty/null.  Same syntax as "source".
-#       This is especially useful for infobox fields, which use different
-#       parameter names across page types and even across individual pages
-#       (e.g. "name" vs. "Name" — infobox field names are case-sensitive).
+#       Especially useful for infobox fields that vary across pages.
 #
 #   type         (optional, default: "string")
 #       Output type coercion.
@@ -113,19 +106,33 @@
 #
 #   default      (optional, default: null)
 #       Value written when all sources (including fallbacks) return empty.
-#       For LLM fields: also used when the LLM response does not exactly match
-#       one of the values in  llm_options.
 #
-#   llm_prompt   (required when source is "llm")
-#       Natural language question asked of the LLM about the page text.
+# =============================================================================
+# LLM EXTRACTION FIELD KEYS  (used in the "llm_extraction.fields:" list)
+# =============================================================================
+#
+#   field_name   (required)
+#       Key used for this value in every output JSON record.
+#
+#   label        (optional)
+#       Human-readable display name.
+#
+#   question     (required)
+#       Natural language question sent to the LLM about the article text.
 #       The full wikitext (up to 12 000 characters) is provided as context.
+#       Write clear, unambiguous questions.  Include the allowed answer values
+#       directly in the question text so the model is fully constrained.
 #
-#   llm_options  (optional, only used when source is "llm")
-#       If provided, the LLM is constrained to respond with exactly one of
-#       these values (multiple-choice mode).  If the LLM response does not
-#       exactly match one of the listed values, the field's  default  value
-#       is used instead.  It is good practice to include an "Unknown" option
-#       so the LLM has a graceful fallback within the constrained set.
+#   options      (optional)
+#       If provided, the LLM is constrained to answer with exactly one of
+#       these values.  Answers are validated (case-insensitive fallback) and
+#       non-matching answers fall back to the  default  value.
+#       Best practice: always include an "Unknown" option as a graceful
+#       fallback so the LLM has somewhere to go when the article is ambiguous.
+#
+#   default      (optional, default: null)
+#       Value used when the LLM response does not match any option, or when
+#       the batch call fails entirely.
 #
 # =============================================================================
 
@@ -133,9 +140,10 @@
 # Example: dog breed taxonomy
 # ---------------------------------------------------------------------------
 
-# Required top-level key.  All field definitions go under this list.
-# (Alternatively, the file can be a bare YAML list without the "questions:"
-# wrapper — but the wrapper form is recommended for clarity.)
+# ---------------------------------------------------------------------------
+# Deterministic fields  (no LLM — fast and free)
+# ---------------------------------------------------------------------------
+
 questions:
 
   # ── Identity ──────────────────────────────────────────────────────────────
@@ -192,78 +200,85 @@ questions:
     type: list
     default: []
 
-  # ── LLM-extracted fields (use the ChatGPT API) ───────────────────────────
-  # Use these for information that cannot be read from structured infobox or
-  # Wikidata fields.
-  #
-  # COST REMINDER: each field below costs ONE API call per accepted page.
-  # With 200 accepted pages, the two fields below = 400 API calls total.
-  # Minimize LLM fields and prefer infobox/wikidata sources where possible.
+# ---------------------------------------------------------------------------
+# LLM batch extraction  (ONE API call per page — returns all fields at once)
+# ---------------------------------------------------------------------------
+#
+# All fields listed here are sent to the LLM in a single call per page.
+# The LLM returns a JSON object with answers to every question at once.
+# Cost: 1 API call per accepted page, no matter how many fields are listed.
 
-  - field_name: breed_size_category
-    label: "Size Category"
-    description: >
-      General size classification of the breed
-      (Toy, Small, Medium, Large, or Giant).
-    source: "llm"
-    llm_prompt: >
-      Based on the Wikipedia article, what is the general size category of
-      this dog breed?  Choose the single best option.
-    llm_options:
-      - "Toy"
-      - "Small"
-      - "Medium"
-      - "Large"
-      - "Giant"
-      - "Unknown"   # always include a fallback option for the LLM to use when uncertain
-    type: string
-    default: "Unknown"    # also used if the LLM response doesn't match any option above
+llm_extraction:
 
-  - field_name: primary_purpose
-    label: "Primary Purpose"
-    description: "What the breed was originally developed to do."
-    source: "llm"
-    llm_prompt: >
-      Based on the Wikipedia article, what was this dog breed originally
-      developed to do?  Give a short phrase (e.g. 'herding livestock',
-      'hunting small game', 'companionship', 'guarding').
-      If unclear, answer 'Unknown'.
-    type: string
-    default: "Unknown"
+  # Optional preamble passed to the LLM before the field questions.
+  # Use this to set context, define common rules, or give instructions that
+  # apply to ALL fields (e.g. "if the page is about an extinct breed,
+  # answer Unknown for every question").
+  prompt_preamble: >
+    Read the Wikipedia article carefully and answer each question below.
+    Return ONLY a valid JSON object with exactly the keys listed.
+    Do not include any explanation, markdown formatting, or extra text.
+
+  fields:
+
+    # Each field is one question in the batch.  The LLM answers all of them
+    # in a single response JSON.
+
+    - field_name: breed_size_category
+      label: "Size Category"
+      question: >
+        Based on the article, what is the general size category of this dog breed?
+        Choose the single best option: "Toy", "Small", "Medium", "Large", or "Giant".
+        Answer "Unknown" if the article does not provide enough information.
+      options:
+        - "Toy"
+        - "Small"
+        - "Medium"
+        - "Large"
+        - "Giant"
+        - "Unknown"
+      default: "Unknown"
+
+    - field_name: primary_purpose
+      label: "Primary Purpose"
+      question: >
+        Based on the article, what was this dog breed originally developed to do?
+        Give a short phrase, e.g. "herding livestock", "hunting small game",
+        "companionship", "guarding", "search and rescue".
+        Answer "Unknown" if the article does not make this clear.
+      default: "Unknown"
 
 # =============================================================================
-# Abbreviated sample output JSON record
+# Sample output JSON record
 # =============================================================================
 #
-# Each record in the output JSON has automatic metadata fields (prefixed with
-# "_") plus one key per extraction question defined above.
+# Metadata fields (_page_title, _wikipedia_url, _is_starting_page) are added
+# automatically.  All other fields come from the "questions:" and
+# "llm_extraction.fields:" definitions above.
 #
 # Success case — all fields found:
 # {
-#   "_page_title":          "Labrador Retriever",
-#   "_wikipedia_url":       "https://en.wikipedia.org/wiki/Labrador_Retriever",
-#   "_is_starting_page":    false,
-#   "page_title":           "Labrador Retriever",
-#   "breed_name":           "Labrador Retriever",
-#   "country_of_origin":    "Canada",
-#   "weight_kg":            "25–36 kg",
-#   "categories":           ["Retrievers", "Dog breeds originating in Canada", ...],
-#   "wikidata_instance_of": ["Q39367"],      ← Q39367 = "dog breed" on Wikidata
-#   "breed_size_category":  "Large",
-#   "primary_purpose":      "retrieving game"
+#   "_page_title":            "Labrador Retriever",
+#   "_wikipedia_url":         "https://en.wikipedia.org/wiki/Labrador_Retriever",
+#   "_is_starting_page":      false,
+#   "page_title":             "Labrador Retriever",
+#   "breed_name":             "Labrador Retriever",
+#   "country_of_origin":      "Canada",
+#   "weight_kg":              "25–36 kg",
+#   "categories":             ["Retrievers", "Dog breeds originating in Canada", ...],
+#   "wikidata_instance_of":   ["Q39367"],
+#   "breed_size_category":    "Large",      ← answered by LLM batch call
+#   "primary_purpose":        "retrieving game"  ← answered by same LLM batch call
 # }
 #
-# Missing-data case — page has no infobox or LLM couldn't determine a value:
+# Missing-data case:
 # {
-#   "_page_title":          "Some Obscure Breed",
-#   "_wikipedia_url":       "https://en.wikipedia.org/wiki/Some_Obscure_Breed",
-#   "_is_starting_page":    false,
-#   "page_title":           "Some Obscure Breed",
-#   "breed_name":           "Some Obscure Breed",   ← fell back to "title" source
-#   "country_of_origin":    null,                   ← no infobox or Wikidata value found
-#   "weight_kg":            null,
-#   "categories":           [],
-#   "wikidata_instance_of": [],
-#   "breed_size_category":  "Unknown",              ← LLM used the "Unknown" option
-#   "primary_purpose":      "Unknown"
+#   "_page_title":            "Some Obscure Breed",
+#   "breed_name":             "Some Obscure Breed",
+#   "country_of_origin":      null,
+#   "weight_kg":              null,
+#   "categories":             [],
+#   "wikidata_instance_of":   [],
+#   "breed_size_category":    "Unknown",
+#   "primary_purpose":        "Unknown"
 # }
