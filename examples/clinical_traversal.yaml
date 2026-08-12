@@ -1,0 +1,59 @@
+# =============================================================================
+# WikiWhisker — Traversal Rules: Clinical Drug Taxonomy
+# =============================================================================
+#
+# LOCATION: copy to  config/clinical_traversal.yaml  and edit as needed.
+#
+# CLI usage:
+#   python wiki_whisker.py \
+#       "Beta blocker" \
+#       "ACE inhibitor" \
+#       --traversal-rules   config/clinical_traversal.yaml \
+#       --extraction-questions config/clinical_extraction.yaml \
+#       --output results/cardiac_drugs.json \
+#       --model gpt-4o
+# =============================================================================
+
+max_secondary_pages: 75
+request_delay_seconds: 0.5
+include_starting_pages_in_output: false
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-filters (fast, no LLM)
+# ---------------------------------------------------------------------------
+link_filters:
+
+  title_not_contains:
+    - "disambiguation"
+    - "list of"
+    - "index"
+    - "history of"
+    - "category"
+
+  # Only follow pages that Wikipedia places in a drug-related category.
+  # This dramatically cuts the candidate set before the LLM filter runs.
+  category_contains:
+    - "drugs"
+    - "medications"
+    - "pharmaceutical"
+    - "pharmacology"
+    - "antihypertensive"
+    - "beta blocker"
+    - "ACE inhibitor"
+    - "cardiac"
+
+# ---------------------------------------------------------------------------
+# LLM traversal filter (runs after link_filters — one API call per candidate)
+# ---------------------------------------------------------------------------
+llm_traversal_filter:
+  enabled: true
+  prompt: >
+    You are deciding whether a Wikipedia page is about a specific pharmaceutical
+    drug or medication (not a drug class overview, list, category page, or
+    disambiguation page).
+    Answer YES if the page is about a single, specific drug or medication
+    (e.g. Metoprolol, Lisinopril, Amlodipine).
+    Answer NO if the page is about a drug class, a list, a general topic,
+    or anything other than a single specific drug.
+  include_page_summary: true
+  include_categories: true

@@ -1,0 +1,123 @@
+# =============================================================================
+# WikiWhisker — Traversal Rules YAML  (fully annotated reference)
+# =============================================================================
+#
+# This file tells WikiWhisker WHICH pages linked from the starting page(s) to
+# visit as secondary pages.
+#
+# LOCATION: copy this file to  config/<name>_traversal.yaml  and edit it.
+# The config/ directory is git-ignored by default; examples/ is tracked.
+#
+# CLI usage:
+#   python wiki_whisker.py "List of dog breeds" \
+#       --traversal-rules   config/dog_breeds_traversal.yaml \
+#       --extraction-questions config/dog_breeds_extraction.yaml \
+#       --output results/dog_breeds.json \
+#       --model gpt-4o
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Crawl limits
+# ---------------------------------------------------------------------------
+
+# Hard cap on accepted secondary pages.  The crawl stops when this many pages
+# have been accepted, even if more candidates remain.  Default: 200.
+max_secondary_pages: 50
+
+# Seconds to sleep between Wikipedia API calls.  Please be polite.  Default: 0.5
+request_delay_seconds: 0.5
+
+# If true, the starting page(s) themselves are also extracted and included in
+# the output records (marked with "_is_starting_page": true).  Default: false
+include_starting_pages_in_output: false
+
+# ---------------------------------------------------------------------------
+# link_filters — deterministic pre-filters  (no LLM, fast and cheap)
+# ---------------------------------------------------------------------------
+# All filters that are set must ALL pass for a page to be accepted.
+# Omitting a key means "no restriction on that dimension".
+# These run BEFORE the LLM filter to reduce expensive LLM calls.
+
+link_filters:
+
+  # ── Title substring filters ──────────────────────────────────────────────
+
+  # Accept only pages whose title contains at least one of these substrings
+  # (case-insensitive).  A single string or a list of strings.
+  #
+  # title_contains: "dog"
+  # title_contains:
+  #   - "dog"
+  #   - "hound"
+  #   - "retriever"
+
+  # Reject pages whose title contains any of these substrings (case-insensitive).
+  #
+  # title_not_contains: "disambiguation"
+  # title_not_contains:
+  #   - "disambiguation"
+  #   - "list of"
+  #   - "index"
+
+  # ── Title regex filter ───────────────────────────────────────────────────
+  # Accept only pages whose title matches this Python regex (re.IGNORECASE).
+  #
+  # title_matches_regex: "^.+\\s+\\(dog breed\\)$"
+
+  # ── Category filters  (triggers one extra API call per candidate page) ───
+
+  # Accept only pages that have at least one Wikipedia category containing
+  # at least one of these substrings (case-insensitive).
+  #
+  # category_contains: "dog breeds"
+  # category_contains:
+  #   - "dog breeds"
+  #   - "working dogs"
+
+  # Reject pages that have any Wikipedia category containing any of these
+  # substrings (case-insensitive).
+  #
+  # category_not_contains: "stub"
+  # category_not_contains:
+  #   - "stub"
+  #   - "disambiguation"
+
+# ---------------------------------------------------------------------------
+# llm_traversal_filter — LLM-based filter  (runs AFTER link_filters)
+# ---------------------------------------------------------------------------
+# Uses the ChatGPT API (via litellm) to ask YES/NO about each candidate page
+# that passed the deterministic filters above.
+#
+# Requires OPENAI_API_KEY (or relevant key for --model) in the environment.
+# Each candidate page that passes link_filters costs one LLM API call.
+
+llm_traversal_filter:
+
+  # Set to true to activate.  Default: false
+  enabled: false
+
+  # Natural language instruction.  The page title (and optionally the Wikipedia
+  # intro paragraph and/or category list) are injected automatically.
+  # The LLM must answer YES (include) or NO (exclude).
+  #
+  # prompt: >
+  #   You are deciding whether a Wikipedia page is about a specific dog breed
+  #   (not a list, category, or disambiguation page).
+  #   Answer YES if the page is about a single, named dog breed.
+  #   Answer NO otherwise.
+
+  # If true, the Wikipedia intro-paragraph text is passed to the LLM.
+  # This gives the LLM better context but costs a little more.  Default: true
+  include_page_summary: true
+
+  # If true, the page's Wikipedia category list is also passed to the LLM.
+  # Adds more context but triggers an extra API call per page.  Default: false
+  include_categories: false
+
+# ---------------------------------------------------------------------------
+# Minimal example — accept all linked pages, up to 10, no LLM
+# ---------------------------------------------------------------------------
+# max_secondary_pages: 10
+# link_filters: {}
+# llm_traversal_filter:
+#   enabled: false

@@ -1,0 +1,215 @@
+# =============================================================================
+# WikiWhisker — Extraction Questions: Clinical Drug Taxonomy
+# =============================================================================
+#
+# Extracts structured data about pharmaceutical drugs from Wikipedia
+# infoboxes, Wikidata, and the LLM (ChatGPT via litellm).
+#
+# Demonstrates: infobox fields, Wikidata properties, list-type fields,
+# fallback_sources chains, and  source: "llm"  with llm_prompt / llm_options.
+#
+# LOCATION: copy to  config/clinical_extraction.yaml  and edit as needed.
+#
+# CLI usage:
+#   python wiki_whisker.py \
+#       "Beta blocker" \
+#       "ACE inhibitor" \
+#       --traversal-rules   config/clinical_traversal.yaml \
+#       --extraction-questions config/clinical_extraction.yaml \
+#       --output results/cardiac_drugs.json \
+#       --model gpt-4o
+# =============================================================================
+
+questions:
+
+  # ── Identity ────────────────────────────────────────────────────────────────
+
+  - field_name: page_title
+    label: "Wikipedia Page Title"
+    description: "Canonical Wikipedia article title."
+    source: "title"
+    type: string
+
+  - field_name: drug_name
+    label: "Drug Name"
+    description: "Generic (INN) name of the drug."
+    source: "infobox:IUPAC_name"
+    fallback_sources:
+      - "infobox:drug_name"
+      - "infobox:name"
+      - "title"
+    type: string
+    default: null
+
+  - field_name: trade_names
+    label: "Trade Names"
+    description: "Brand / trade names listed in the infobox."
+    source: "infobox:tradename"
+    fallback_sources:
+      - "infobox:brand_name"
+    type: string          # raw string; often comma-separated in the infobox
+    default: null
+
+  # ── Classification (infobox + Wikidata — no LLM cost) ───────────────────────
+
+  - field_name: drug_class
+    label: "Drug Class (infobox)"
+    description: >
+      Pharmacological class from the infobox; falls back to Wikidata P2175
+      (medical condition treated).  Use the llm_drug_class field below for
+      a more reliable LLM-extracted version.
+    source: "infobox:class"
+    fallback_sources:
+      - "infobox:drug_class"
+      - "wikidata:P2175"
+    type: string
+    default: null
+
+  - field_name: atc_code
+    label: "ATC Code"
+    description: >
+      WHO Anatomical Therapeutic Chemical classification code.
+      Multiple codes are joined by ', '.
+    source: "infobox:ATC_code"
+    fallback_sources:
+      - "infobox:ATC_prefix"
+      - "wikidata:P267"
+    type: string
+    default: null
+
+  - field_name: wikidata_instance_of
+    label: "Wikidata: instance of (P31)"
+    description: "Wikidata Q-IDs for the ontological type of this article."
+    source: "wikidata:P31"
+    type: list
+    default: []
+
+  # ── Mechanism & pharmacology (infobox — no LLM cost) ────────────────────────
+
+  - field_name: mechanism_of_action
+    label: "Mechanism of Action"
+    description: "Short description of pharmacological mechanism (infobox)."
+    source: "infobox:mechanism_of_action"
+    fallback_sources:
+      - "infobox:action"
+    type: string
+    default: null
+
+  - field_name: bioavailability
+    label: "Bioavailability"
+    description: "Oral bioavailability as reported in the infobox."
+    source: "infobox:bioavailability"
+    type: string
+    default: null
+
+  - field_name: half_life
+    label: "Biological Half-Life"
+    description: "Elimination half-life (may include units)."
+    source: "infobox:elimination_half-life"
+    fallback_sources:
+      - "infobox:half-life"
+    type: string
+    default: null
+
+  - field_name: routes_of_administration
+    label: "Routes of Administration"
+    description: "How the drug can be administered (infobox)."
+    source: "infobox:routes_of_administration"
+    fallback_sources:
+      - "infobox:route_of_administration"
+    type: string
+    default: null
+
+  - field_name: fda_approval_year
+    label: "FDA Approval (Wikidata P3364)"
+    description: >
+      US FDA NDA approval date from Wikidata property P3364.
+      Returned as a raw Wikidata time string (e.g. "+1978-00-00T00:00:00Z").
+    source: "wikidata:P3364"
+    type: string
+    default: null
+
+  # ── LLM-extracted fields  (source: "llm" — one API call per field per page) ──
+  # These use the ChatGPT API (or --model override) to read the page wikitext
+  # and answer a natural language question.  Each costs one LLM API call.
+
+  - field_name: llm_drug_class
+    label: "Drug Class (LLM)"
+    description: >
+      Pharmacological class extracted by the LLM from the full article text.
+      More reliable than the infobox class field for complex pages.
+    source: "llm"
+    llm_prompt: >
+      Based on the Wikipedia article text, what is the pharmacological class
+      of this drug?  Give a short phrase (e.g. 'Beta blocker', 'ACE inhibitor',
+      'Calcium channel blocker', 'Diuretic', 'Anticoagulant').
+      If you cannot determine it, answer 'Unknown'.
+    type: string
+    default: "Unknown"
+
+  - field_name: fda_approved
+    label: "FDA Approved (LLM)"
+    description: "Whether the drug is approved by the US FDA, per the article."
+    source: "llm"
+    llm_prompt: >
+      Based on the Wikipedia article, is this drug approved for use in the
+      United States by the FDA?
+    llm_options:
+      - "Yes"
+      - "No"
+      - "Unknown"
+    type: string
+    default: "Unknown"
+
+  - field_name: primary_indication
+    label: "Primary Clinical Indication (LLM)"
+    description: "The main medical condition this drug is used to treat."
+    source: "llm"
+    llm_prompt: >
+      Based on the Wikipedia article, what is the primary clinical indication
+      (the main medical condition this drug is used to treat)?
+      Give a concise answer of 1–5 words (e.g. 'hypertension',
+      'heart failure', 'atrial fibrillation').
+      If unclear, answer 'Unknown'.
+    type: string
+    default: "Unknown"
+
+  # ── Taxonomy metadata ────────────────────────────────────────────────────────
+
+  - field_name: categories
+    label: "Wikipedia Categories"
+    description: >
+      Full list of Wikipedia categories.  Useful for downstream classification
+      and for validating that the page is actually about a drug.
+    source: "category_list"
+    type: list
+    default: []
+
+# =============================================================================
+# Sample output JSON record (abbreviated)
+# =============================================================================
+#
+# {
+#   "_page_title":              "Metoprolol",
+#   "_wikipedia_url":           "https://en.wikipedia.org/wiki/Metoprolol",
+#   "_is_starting_page":        false,
+#   "page_title":               "Metoprolol",
+#   "drug_name":                "Metoprolol",
+#   "trade_names":              "Lopressor, Toprol-XL",
+#   "drug_class":               "Beta blocker",
+#   "atc_code":                 "C07AB02",
+#   "wikidata_instance_of":     ["Q12140"],
+#   "mechanism_of_action":      "Selective beta-1 adrenergic receptor blocker",
+#   "bioavailability":          "~50%",
+#   "half_life":                "3–7 hours",
+#   "routes_of_administration": "Oral, intravenous",
+#   "fda_approval_year":        "+1978-00-00T00:00:00Z",
+#   "llm_drug_class":           "Beta blocker",
+#   "fda_approved":             "Yes",
+#   "primary_indication":       "hypertension",
+#   "categories": [
+#     "Beta blockers",
+#     "Antihypertensive agents",
+#     "Drugs acting on the cardiovascular system"
+#   ]
+# }

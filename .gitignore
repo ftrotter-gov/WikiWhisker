@@ -162,3 +162,12 @@ cython_debug/
 
 # LSP config files
 pyrightconfig.json
+
+# WikiWhisker — generated output
+results/
+output.json
+
+# WikiWhisker — user config files (may contain sensitive prompts/paths)
+# Copy examples/ files into config/ and customise them locally.
+# Commit config/ only if your configs contain no sensitive data.
+config/

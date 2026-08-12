@@ -1,0 +1,194 @@
+# =============================================================================
+# WikiWhisker — Extraction Questions YAML  (fully annotated reference)
+# =============================================================================
+#
+# This file defines WHAT data to extract from each visited Wikipedia page
+# and HOW that data maps to fields in the output JSON file.
+#
+# LOCATION: copy this file to  config/<name>_extraction.yaml  and edit it.
+# The config/ directory is git-ignored by default; examples/ is tracked.
+#
+# CLI usage:
+#   python wiki_whisker.py "List of dog breeds" \
+#       --traversal-rules   config/dog_breeds_traversal.yaml \
+#       --extraction-questions config/dog_breeds_extraction.yaml \
+#       --output results/dog_breeds.json \
+#       --model gpt-4o
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Field definition keys
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   field_name   (required)
+#       Key used for this value in every output JSON record.
+#       No spaces recommended.
+#
+#   label        (optional)
+#       Human-readable display name.  Appears in output JSON meta.output_schema.
+#
+#   description  (optional)
+#       Prose description.  Passed as context to the LLM when source is "llm".
+#
+#   source       (required)
+#       Where to read the value.  One of:
+#
+#         "title"
+#             The Wikipedia page title itself.
+#
+#         "category_list"
+#             Full list of Wikipedia categories for the page (JSON array).
+#             Use with  type: list.
+#
+#         "infobox:<field_name>"
+#             Named parameter from the page's first Infobox template.
+#             e.g.  source: "infobox:birth_date"
+#             Field names are case-sensitive; match the infobox parameter name
+#             exactly (view a page's wikitext to find them).
+#
+#         "wikidata:<property_id>"
+#             Wikidata property on the item linked to this page.
+#             e.g.  source: "wikidata:P31"   (instance of)
+#                   source: "wikidata:P495"  (country of origin)
+#             Multiple values: first returned for scalar types;
+#             all returned for  type: list.
+#
+#         "llm"
+#             Ask the LLM the question in  llm_prompt  about the page text.
+#             Requires  llm_prompt  to be set.
+#             Uses the model specified by  --model  (default: gpt-4o).
+#             Requires OPENAI_API_KEY in environment (or relevant provider key).
+#
+#   fallback_sources  (optional)
+#       Ordered list of additional sources tried when the primary source
+#       returns empty/null.  Same syntax as "source".
+#
+#   type         (optional, default: "string")
+#       Output type coercion.
+#         string  — cast to string (joins lists with ", ")
+#         list    — always return a JSON array
+#         int     — parse as integer (strips commas)
+#         float   — parse as float   (strips commas)
+#         bool    — "yes"/"true"/"1" → true, everything else → false
+#
+#   default      (optional, default: null)
+#       Value written when all sources return empty.
+#
+#   llm_prompt   (required when source is "llm")
+#       Natural language question asked of the LLM about the page text.
+#       The full wikitext (up to 12 000 characters) is provided as context.
+#
+#   llm_options  (optional, only used when source is "llm")
+#       If provided, the LLM is constrained to respond with exactly one of
+#       these values (multiple-choice mode).
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Example: dog breed taxonomy
+# ---------------------------------------------------------------------------
+
+questions:
+
+  # ── Identity ──────────────────────────────────────────────────────────────
+
+  - field_name: page_title
+    label: "Wikipedia Page Title"
+    description: "Canonical Wikipedia article title."
+    source: "title"
+    type: string
+
+  - field_name: breed_name
+    label: "Breed Name"
+    description: "Common name of the dog breed."
+    source: "infobox:name"
+    fallback_sources:
+      - "infobox:Name"
+      - "title"
+    type: string
+    default: null
+
+  # ── Structured fields (infobox / Wikidata — no LLM cost) ─────────────────
+
+  - field_name: country_of_origin
+    label: "Country of Origin"
+    description: "Country where the breed was developed."
+    source: "infobox:country"
+    fallback_sources:
+      - "infobox:origin"
+      - "wikidata:P495"
+    type: string
+    default: null
+
+  - field_name: weight_kg
+    label: "Weight (kg)"
+    description: "Typical adult weight, from the infobox (kept as string)."
+    source: "infobox:weight"
+    type: string
+    default: null
+
+  - field_name: categories
+    label: "Wikipedia Categories"
+    description: "All Wikipedia categories assigned to this page."
+    source: "category_list"
+    type: list
+    default: []
+
+  - field_name: wikidata_instance_of
+    label: "Wikidata: instance of (P31)"
+    description: "Wikidata Q-IDs for what this article is an instance of."
+    source: "wikidata:P31"
+    type: list
+    default: []
+
+  # ── LLM-extracted fields (use the ChatGPT API) ───────────────────────────
+  # These demonstrate source: "llm" with llm_prompt and llm_options.
+  # Each field below costs one API call per page.
+
+  - field_name: breed_size_category
+    label: "Size Category"
+    description: >
+      General size classification of the breed
+      (Toy, Small, Medium, Large, or Giant).
+    source: "llm"
+    llm_prompt: >
+      Based on the Wikipedia article, what is the general size category of
+      this dog breed?  Choose the single best option.
+    llm_options:
+      - "Toy"
+      - "Small"
+      - "Medium"
+      - "Large"
+      - "Giant"
+      - "Unknown"
+    type: string
+    default: "Unknown"
+
+  - field_name: primary_purpose
+    label: "Primary Purpose"
+    description: "What the breed was originally developed to do."
+    source: "llm"
+    llm_prompt: >
+      Based on the Wikipedia article, what was this dog breed originally
+      developed to do?  Give a short phrase (e.g. 'herding livestock',
+      'hunting small game', 'companionship', 'guarding').
+      If unclear, answer 'Unknown'.
+    type: string
+    default: "Unknown"
+
+# =============================================================================
+# Abbreviated sample output JSON record
+# =============================================================================
+#
+# {
+#   "_page_title":          "Labrador Retriever",
+#   "_wikipedia_url":       "https://en.wikipedia.org/wiki/Labrador_Retriever",
+#   "_is_starting_page":    false,
+#   "page_title":           "Labrador Retriever",
+#   "breed_name":           "Labrador Retriever",
+#   "country_of_origin":    "Canada",
+#   "weight_kg":            "25–36 kg",
+#   "categories":           ["Retrievers", "Dog breeds originating in Canada", ...],
+#   "wikidata_instance_of": ["Q39367"],
+#   "breed_size_category":  "Large",
+#   "primary_purpose":      "retrieving game"
+# }
