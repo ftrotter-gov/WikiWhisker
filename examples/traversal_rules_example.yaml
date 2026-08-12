@@ -2,8 +2,26 @@
 # WikiWhisker — Traversal Rules YAML  (fully annotated reference)
 # =============================================================================
 #
-# This file tells WikiWhisker WHICH pages linked from the starting page(s) to
-# visit as secondary pages.
+# HOW WIKIWHISKER WORKS (quick orientation)
+# ──────────────────────────────────────────
+# 1. You give WikiWhisker one or more "starting pages" on the command line
+#    (e.g. "List of dog breeds").
+# 2. WikiWhisker collects every Wikipedia link found on those starting pages.
+#    Each linked page is a "candidate secondary page".
+# 3. This file controls which of those candidates are ACCEPTED and crawled.
+#    Candidates pass through two optional filter layers (see below).
+# 4. The extraction-questions YAML (a separate file) controls what data is
+#    pulled from each accepted page and written to the output JSON.
+#
+# QUICK START — if you just want to get going, your entire traversal file
+# can be as simple as:
+#
+#   max_secondary_pages: 50
+#   link_filters: {}
+#
+# That accepts every linked page, up to 50, with no filtering.
+# Copy the fuller template below into config/<name>_traversal.yaml and
+# uncomment whichever filters you need.
 #
 # LOCATION: copy this file to  config/<name>_traversal.yaml  and edit it.
 # The config/ directory is git-ignored by default; examples/ is tracked.
@@ -20,9 +38,11 @@
 # Crawl limits
 # ---------------------------------------------------------------------------
 
-# Hard cap on accepted secondary pages.  The crawl stops when this many pages
-# have been accepted, even if more candidates remain.  Default: 200.
-max_secondary_pages: 50
+# Hard cap on accepted secondary pages.  The crawl stops — and no further
+# candidates are even evaluated — as soon as this many pages have been
+# accepted.  Pages that appear later in the link list are skipped entirely.
+# Default: 200.
+max_secondary_pages: 200
 
 # Seconds to sleep between Wikipedia API calls.  Please be polite.  Default: 0.5
 request_delay_seconds: 0.5
@@ -32,13 +52,37 @@ request_delay_seconds: 0.5
 include_starting_pages_in_output: false
 
 # ---------------------------------------------------------------------------
+# TWO-LAYER FILTER PIPELINE
+# ---------------------------------------------------------------------------
+#
+# Candidates flow through the two filters below in order:
+#
+#   [all linked pages]
+#        │
+#        ▼
+#   link_filters  ◀─── fast, deterministic, no LLM cost
+#        │
+#        ▼
+#   llm_traversal_filter  ◀─── slower, flexible, costs one API call per page
+#        │
+#        ▼
+#   [accepted secondary pages]
+#
+# TIP: If you enable the LLM filter but set NO link_filters, every linked
+# page is passed to the LLM — potentially hundreds of API calls.  Use
+# link_filters first to narrow down candidates cheaply.
+
+# ---------------------------------------------------------------------------
 # link_filters — deterministic pre-filters  (no LLM, fast and cheap)
 # ---------------------------------------------------------------------------
-# All filters that are set must ALL pass for a page to be accepted.
-# Omitting a key means "no restriction on that dimension".
-# These run BEFORE the LLM filter to reduce expensive LLM calls.
+# All filters that are SET must ALL pass for a page to be accepted.
+# Omitting a key (or leaving link_filters empty) means "no restriction on
+# that dimension" — all candidates pass through to the next stage.
 
 link_filters:
+
+  # (empty = no active filters; every linked page is a candidate)
+  # Uncomment any combination of filters below to restrict which pages pass.
 
   # ── Title substring filters ──────────────────────────────────────────────
 
@@ -88,8 +132,14 @@ link_filters:
 # Uses the ChatGPT API (via litellm) to ask YES/NO about each candidate page
 # that passed the deterministic filters above.
 #
-# Requires OPENAI_API_KEY (or relevant key for --model) in the environment.
-# Each candidate page that passes link_filters costs one LLM API call.
+# Requires OPENAI_API_KEY (or the relevant key for --model) in the environment.
+# Each candidate that passes link_filters costs one LLM API call when this
+# filter is enabled.
+#
+# To activate this filter:
+#   1. Set  enabled: true
+#   2. Uncomment  prompt:  and write your YES/NO question
+#   3. Make sure OPENAI_API_KEY is set in your environment (or .env file)
 
 llm_traversal_filter:
 
@@ -106,18 +156,13 @@ llm_traversal_filter:
   #   Answer YES if the page is about a single, named dog breed.
   #   Answer NO otherwise.
 
+  # The options below have no effect when enabled: false, but are shown here
+  # as documentation for when you activate the filter.
+
   # If true, the Wikipedia intro-paragraph text is passed to the LLM.
   # This gives the LLM better context but costs a little more.  Default: true
-  include_page_summary: true
+  # include_page_summary: true
 
   # If true, the page's Wikipedia category list is also passed to the LLM.
   # Adds more context but triggers an extra API call per page.  Default: false
-  include_categories: false
-
-# ---------------------------------------------------------------------------
-# Minimal example — accept all linked pages, up to 10, no LLM
-# ---------------------------------------------------------------------------
-# max_secondary_pages: 10
-# link_filters: {}
-# llm_traversal_filter:
-#   enabled: false
+  # include_categories: false

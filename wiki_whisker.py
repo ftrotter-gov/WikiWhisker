@@ -30,7 +30,7 @@ import yaml
 # ---------------------------------------------------------------------------
 
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
-USER_AGENT = "WikiWhisker/1.0 (https://github.com/DSACMS/WikiWhisker)"
+USER_AGENT = "WikiWhisker/1.0 (https://github.com/ftrotter-gov/WikiWhisker)"
 
 # Maximum number of wikitext characters sent to the LLM for extraction.
 # Keeps token costs reasonable; most infoboxes appear in the first 8 000 chars.
@@ -97,28 +97,97 @@ def get_page_summary(title: str) -> str:
     return ""
 
 
-def get_page_links(title: str) -> list[str]:
-    """Return all internal Wikipedia links from a page (namespace 0 only)."""
-    links = []
-    params = {
-        "action": "query",
-        "titles": title,
-        "prop": "links",
-        "plnamespace": 0,
-        "pllimit": "max",
-    }
-    while True:
-        data = _api_get(params)
-        pages = data.get("query", {}).get("pages", [])
-        if pages:
-            for link in pages[0].get("links", []):
-                links.append(link["title"])
-        cont = data.get("continue")
-        if cont:
-            params.update(cont)
-        else:
+# Section headings whose links must NEVER be followed.  Matching is
+# case-insensitive; the pattern covers the most common English variants.
+_NOISE_SECTION_RE = re.compile(
+    r"^==+\s*("
+    r"references?|bibliography|bibliographies|footnotes?|notes?|"
+    r"further reading|see also|external links?|citations?|sources?"
+    r")\s*==+\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Wikilink pattern: [[Target]] or [[Target|Label]]
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]|#][^\[\]|#]*?)(?:\|[^\[\]]*)?\]\]")
+
+
+def _strip_noise_sections(wikitext: str) -> str:
+    """
+    Remove the content of "noise" sections (References, Bibliography,
+    Further reading, See also, External links, etc.) from wikitext.
+    Returns the wikitext up to the first noise-section heading found.
+    If a noise section appears in the middle of the article, everything
+    from that heading onward is also removed so that subsequent sections
+    (e.g. a "Notes" section followed by "Appendix") are not accidentally
+    included.
+    """
+    lines = wikitext.splitlines(keepends=True)
+    result_lines = []
+    for line in lines:
+        if _NOISE_SECTION_RE.match(line.rstrip()):
+            # Stop as soon as we hit any noise-section heading.
+            # Wikipedia convention puts these at the end, so we can
+            # safely discard everything from here on.
             break
-    return links
+        result_lines.append(line)
+    return "".join(result_lines)
+
+
+def get_page_links(title: str) -> list[str]:
+    """
+    Return internal Wikipedia links from the *body* of a page (namespace 0
+    only), excluding any links that appear in bibliography, references,
+    further-reading, see-also, external-links, notes, or footnotes sections.
+
+    Strategy:
+      1. Fetch the raw wikitext for the page.
+      2. Strip out noise sections (everything from the first noise heading on).
+      3. Parse [[wikilinks]] from the remaining body text.
+      4. Validate each candidate against the Wikipedia API to ensure it exists
+         and lives in namespace 0 (skips redirects to other namespaces,
+         non-existent pages, etc.).  A single batched API call is used.
+    """
+    wikitext = get_page_wikitext(title)
+    if not wikitext:
+        return []
+
+    body = _strip_noise_sections(wikitext)
+
+    # Extract raw link targets from [[…]] markup in the body.
+    raw_targets: list[str] = []
+    seen_raw: set[str] = set()
+    for m in _WIKILINK_RE.finditer(body):
+        target = m.group(1).strip()
+        # Skip file/image/category/template namespaces
+        if ":" in target:
+            continue
+        # Normalise: first letter capitalised, spaces
+        target = target[:1].upper() + target[1:] if target else target
+        target = target.replace("_", " ")
+        if target and target not in seen_raw:
+            seen_raw.add(target)
+            raw_targets.append(target)
+
+    if not raw_targets:
+        return []
+
+    # Validate via the API in batches of 50 (API limit).
+    valid_links: list[str] = []
+    batch_size = 50
+    for i in range(0, len(raw_targets), batch_size):
+        batch = raw_targets[i : i + batch_size]
+        data = _api_get({
+            "action": "query",
+            "titles": "|".join(batch),
+            "redirects": "",          # resolve redirects
+        })
+        pages = data.get("query", {}).get("pages", [])
+        for page in pages:
+            # ns == 0 → article namespace; missing → page doesn't exist
+            if page.get("ns") == 0 and not page.get("missing"):
+                valid_links.append(page["title"])
+
+    return valid_links
 
 
 def get_page_categories(title: str) -> list[str]:
