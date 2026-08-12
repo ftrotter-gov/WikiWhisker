@@ -1,0 +1,117 @@
+# =============================================================================
+# WikiWhisker — Traversal Rules: Medical Specialty Titles
+# =============================================================================
+#
+# Starting page: "Medical specialty"
+#   https://en.wikipedia.org/wiki/Medical_specialty
+#
+# This config crawls the "Medical specialty" Wikipedia article and accepts
+# every linked page that represents a single, specific clinical medical
+# specialty — rejecting list pages, disambiguation pages, overview pages,
+# and any page that does not belong to the Wikipedia "Medical specialties"
+# category.
+#
+# The goal is to collect pages that:
+#   1. Represent ONE named medical/clinical specialty.
+#   2. Belong to the Wikipedia "Medical specialties" category.
+#   3. Contain an infobox with a "specialist" field naming the practitioner
+#      title (e.g. Neurologist, Cardiologist, Pediatrician).
+#
+# An LLM filter runs as a second pass to confirm that each candidate page is
+# about a single, specific medical specialty AND that the page names the
+# practitioner title for that specialty.
+#
+# CLI usage:
+#   python wiki_whisker.py "Medical specialty" \
+#       --traversal-rules   examples/medical_specialties_traversal.yaml \
+#       --extraction-questions examples/medical_specialties_extraction.yaml \
+#       --output results/medical_specialty_titles.json \
+#       --model gpt-4o
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Crawl limits
+# ---------------------------------------------------------------------------
+
+# There are on the order of 40–80 distinct named medical specialties linked
+# from the starting page.  Set high enough to capture all of them.
+max_secondary_pages: 1000
+
+# Be polite to the Wikipedia API.
+request_delay_seconds: 0.5
+
+# The "Medical specialty" page is a high-level overview page — do not include
+# it in the output records.
+include_starting_pages_in_output: false
+
+# ---------------------------------------------------------------------------
+# Deterministic pre-filters  (fast, no LLM cost)
+# ---------------------------------------------------------------------------
+
+link_filters:
+
+  # Reject disambiguation pages, list pages, and index/history pages outright.
+  # These are navigation/meta pages, not pages about individual specialties.
+  title_not_contains:
+    - "disambiguation"
+    - "list of"
+    - "index of"
+    - "history of"
+    - "outline of"
+    - "category"
+
+  # Accept only pages whose Wikipedia categories include "Medical specialties".
+  # This is the same category that pages like Neurology, Cardiology, and
+  # Psychiatry belong to.  It cheaply eliminates non-specialty pages
+  # (hospitals, organisations, general medicine topics, etc.) that happen
+  # to be linked from the starting page.
+  #
+  # category_contains is an OR check: a page passes if ANY of its categories
+  # contains ANY of the listed substrings (case-insensitive).
+  category_contains:
+    - "medical specialties"
+    - "clinical specialties"
+
+# ---------------------------------------------------------------------------
+# LLM traversal filter  (runs AFTER the deterministic filters above)
+# ---------------------------------------------------------------------------
+# Each candidate that passed link_filters is confirmed by the LLM.
+# This catches edge cases the category filter cannot handle, such as pages
+# that are categorised as a medical specialty but are actually overview,
+# combined, or historical pages rather than a single named specialty.
+#
+# Crucially: the LLM also checks that the Wikipedia page explicitly names
+# the practitioner title for that specialty (e.g. "neurologist"), because
+# pages for very new or niche specialties sometimes lack an established
+# practitioner title — those pages should be excluded.
+
+llm_traversal_filter:
+
+  enabled: true
+
+  prompt: >
+    You are deciding whether a Wikipedia page meets ALL of the following
+    criteria:
+
+      1. The page is about a single, specific medical or clinical specialty
+         (e.g. Neurology, Cardiology, Pediatrics, Psychiatry).
+         It must NOT be a list page, a disambiguation page, a broad overview
+         covering many specialties, or a page about a medical concept that is
+         not itself a named specialty.
+
+      2. The page explicitly names the practitioner title — the word used for
+         a physician or clinician who practises that specialty (e.g.
+         "neurologist", "cardiologist", "pediatrician", "psychiatrist").
+         The title should appear in the infobox "Specialist" field or in the
+         opening paragraph of the article.
+         Pages that only say "physician who does X" or "doctor specialising in
+         Y" without giving a single recognised specialist title do NOT qualify.
+
+    Answer YES if and only if BOTH criteria are met.
+    Answer NO if either criterion is not met.
+
+  # Provide the intro paragraph so the LLM can check for the specialist title.
+  include_page_summary: true
+
+  # Provide the category list so the LLM can verify the specialty classification.
+  include_categories: true

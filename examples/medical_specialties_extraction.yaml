@@ -1,0 +1,166 @@
+# =============================================================================
+# WikiWhisker — Extraction Questions: Medical Specialty Titles
+# =============================================================================
+#
+# Extracts structured data about clinical medical specialties from Wikipedia.
+#
+# Dataset goal:
+#   Produce a JSON dataset that captures, for every named medical specialty
+#   found on Wikipedia's "Medical specialty" page, exactly two things:
+#
+#     1. specialty_name   — The name of the medical specialty.
+#     2. specialist_title — The title given to a practitioner of that specialty
+#                           (e.g. "neurologist", "cardiologist", "pediatrician").
+#
+# DESIGN NOTES
+# ────────────
+# The Wikipedia {{Infobox medical specialty}} template includes a "specialist"
+# parameter that directly names the practitioner title.  This is the primary
+# source.  For pages that use a slightly different infobox or capitalisation,
+# fallback_sources try common variants.
+#
+# An LLM batch field is included as a final safety net: if the infobox does
+# not contain the specialist title, the LLM reads the article text to extract
+# it from the opening paragraph (where specialty pages typically introduce the
+# practitioner title, e.g. "Neurology is … practised by a neurologist").
+#
+# COST
+# ────
+# With ~50–80 specialty pages and ONE LLM batch call per page (for the
+# specialist_title_llm fallback field), expect roughly 50–80 API calls total
+# for extraction.
+#
+# CLI usage:
+#   python wiki_whisker.py "Medical specialty" \
+#       --traversal-rules   examples/medical_specialties_traversal.yaml \
+#       --extraction-questions examples/medical_specialties_extraction.yaml \
+#       --output results/medical_specialty_titles.json \
+#       --model gpt-4o
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Deterministic fields  (no LLM — fast and free)
+# ---------------------------------------------------------------------------
+
+questions:
+
+  # ── Identity ───────────────────────────────────────────────────────────────
+
+  - field_name: page_title
+    label: "Wikipedia Page Title"
+    description: "Canonical Wikipedia article title for this medical specialty."
+    source: "title"
+    type: string
+
+  - field_name: specialty_name
+    label: "Specialty Name"
+    description: >
+      The name of the medical specialty, from the infobox title field or
+      the page title itself.  Examples: "Neurology", "Cardiology",
+      "Pediatrics", "Psychiatry". "Pediatrics"
+    source: "infobox:title"
+    fallback_sources:
+      - "infobox:name"    # some infobox templates use "name" instead of "title"
+      - "title"           # last resort: use the Wikipedia page title
+    type: string
+    default: null
+
+  # ── Practitioner title (the core data point of this study) ─────────────────
+
+  - field_name: specialist_title
+    label: "Specialist Title"
+    description: >
+      The title given to a physician or clinician who practises this
+      specialty, drawn from the infobox "specialist" field.
+      Examples: "Neurologist", "Cardiologist", "Pediatrician",
+      "Psychiatrist", "Dermatologist". "Pediatrician"
+      Null if the infobox does not include this field.
+      If there is a british and US spelling variant, use the US spelling (e.g. "Pediatrician" not "Paediatrician").
+    source: "infobox:specialist"
+    fallback_sources:
+      - "infobox:Specialist"    # capitalised variant used on some pages
+    type: string
+    default: null
+
+# ---------------------------------------------------------------------------
+# LLM batch extraction  (ONE API call per page — returns all fields at once)
+# ---------------------------------------------------------------------------
+#
+# This section extracts the specialist title from the article text when the
+# infobox does not provide it.  It is also used to confirm the specialty name
+# when the infobox title is missing or ambiguous.
+#
+# Cost: ONE API call per accepted specialty page.
+
+llm_extraction:
+
+  prompt_preamble: >
+    Read the Wikipedia article for this medical specialty carefully and answer
+    each of the following questions.
+    Return ONLY a valid JSON object with exactly the keys listed below —
+    no extra text, no markdown, no explanation.
+
+    Important rules that apply to ALL questions:
+      - Base your answers strictly on what the Wikipedia article states.
+        Do not use outside knowledge beyond what is in the article text.
+      - For the specialist title, prefer the term used in the infobox
+        "Specialist" field or the opening paragraph of the article.
+        The opening paragraph typically introduces the specialty with a phrase
+        like "Neurology is … practised by a neurologist."
+
+  fields:
+
+    # ── Specialist title (LLM fallback / confirmation) ──────────────────────
+
+    - field_name: specialist_title_llm
+      label: "Specialist Title (LLM)"
+      question: >
+        What is the specialist title — the single word or short phrase used
+        to describe a physician or clinician who practises this medical
+        specialty?
+        Examples: "neurologist", "cardiologist", "pediatrician",
+        "psychiatrist", "dermatologist", "orthopedic surgeon".
+        Look first in the infobox "Specialist" field, then in the opening
+        paragraph of the article.
+        If the article gives no established specialist title and only describes
+        practitioners as "physician who does X" or "doctor specialising in Y",
+        answer "None established".
+        Answer with just the title itself (e.g. "neurologist"), not a sentence.
+        If there is a british and US spelling variant, use the US spelling (e.g. "Pediatrician" not "Paediatrician").
+
+      default: "None listed"
+
+# =============================================================================
+# Sample output JSON record
+# =============================================================================
+#
+# {
+#   "_page_title":          "Neurology",
+#   "_wikipedia_url":       "https://en.wikipedia.org/wiki/Neurology",
+#   "_is_starting_page":    false,
+#   "page_title":           "Neurology",
+#   "specialty_name":       "Neurology",
+#   "specialist_title":     "Neurologist",
+#   "specialist_title_llm": "neurologist"
+# }
+#
+# {
+#   "_page_title":          "Pediatrics",
+#   "_wikipedia_url":       "https://en.wikipedia.org/wiki/Pediatrics",
+#   "_is_starting_page":    false,
+#   "page_title":           "Pediatrics",
+#   "specialty_name":       "Pediatrics",
+#   "specialist_title":     "Pediatrician",
+#   "specialist_title_llm": "pediatrician"
+# }
+#
+# Specialty with no established title:
+# {
+#   "_page_title":          "Wilderness medicine",
+#   "_wikipedia_url":       "https://en.wikipedia.org/wiki/Wilderness_medicine",
+#   "_is_starting_page":    false,
+#   "page_title":           "Wilderness medicine",
+#   "specialty_name":       "Wilderness medicine",
+#   "specialist_title":     null,
+#   "specialist_title_llm": "None established"
+# }
