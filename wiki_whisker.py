@@ -7,10 +7,13 @@ Usage:
         --traversal-rules   config/traversal.yaml \\
         --extraction-questions config/extraction.yaml \\
         [--output results/output.json] \\
-        [--model  gpt-4o]
+        [--model  gpt-4o] \\
+        [--cache-dir json_cache] \\
+        [--project-id my_project]
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -408,7 +411,99 @@ def llm_extract_field(
 
 
 # ---------------------------------------------------------------------------
-# Traversal rule evaluation
+# JSON cache — per-project, per-page, resumable
+# ---------------------------------------------------------------------------
+#
+# Cache directory layout:
+#
+#   json_cache/
+#     <project_id>/
+#       <safe_title>.json   ← one file per Wikipedia page evaluated
+#
+# Each cache file has the structure:
+#
+#   {
+#     "_page_title": "Labrador Retriever",
+#     "_wikipedia_url": "https://en.wikipedia.org/wiki/Labrador_Retriever",
+#     "_cache_version": 1,
+#     "_llm_traversal": {          ← present only if LLM traversal was run
+#       "model": "gpt-4o",
+#       "decision": true           ← true = accepted, false = rejected
+#     },
+#     "_extraction": {             ← present only if extraction was completed
+#       "model": "gpt-4o",
+#       "fields": {                ← key = field_name, value = extracted value
+#         "page_title": "Labrador Retriever",
+#         "health_issues": "True",
+#         ...
+#       }
+#     }
+#   }
+#
+# RESUMABILITY
+# ────────────
+# • Traversal phase: if "_llm_traversal" is present in the cache for a page,
+#   the cached decision is used instead of making a new LLM call.
+# • Extraction phase: if "_extraction" is present and contains ALL required
+#   field_names, the cached field values are used and no LLM calls are made.
+# • If the model changes between runs, cached LLM results are still reused
+#   (the cache records which model produced each result for auditing).
+#   To force a fresh run with a new model, delete the project cache directory.
+
+CACHE_VERSION = 1
+
+
+def _title_to_cache_filename(title: str) -> str:
+    """
+    Convert a Wikipedia page title to a safe filename for the cache.
+    Uses the title with filesystem-unsafe chars replaced, plus a short
+    hash suffix to avoid collisions on long or unusual titles.
+    """
+    safe = re.sub(r'[^\w\-. ]', '_', title).strip().replace(' ', '_')
+    # Truncate to 80 chars and append an 8-char hash to guarantee uniqueness
+    short_hash = hashlib.md5(title.encode("utf-8")).hexdigest()[:8]
+    return f"{safe[:80]}_{short_hash}.json"
+
+
+def _get_cache_path(cache_dir: Path, project_id: str, title: str) -> Path:
+    """Return the Path for the cache file for a given page title."""
+    return cache_dir / project_id / _title_to_cache_filename(title)
+
+
+def _load_cache(cache_path: Path) -> dict:
+    """Load the cache JSON for a page, or return an empty dict if not present."""
+    if cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_cache(cache_path: Path, data: dict) -> None:
+    """Atomically write the cache JSON for a page."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a temp file then rename for atomicity
+    tmp = cache_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+    tmp.replace(cache_path)
+
+
+def _derive_project_id(output_path: str) -> str:
+    """
+    Derive a project ID from the output path.
+    e.g. "results/dog_breeds.json" → "dog_breeds"
+         "output.json"             → "output"
+    """
+    stem = Path(output_path).stem          # filename without extension
+    # Replace non-alphanumeric chars with underscores for a clean directory name
+    return re.sub(r'[^\w]', '_', stem).strip('_') or "wikwhisker_project"
+
+
+# ---------------------------------------------------------------------------
+# Traversal rule evaluation  (cache-aware)
 # ---------------------------------------------------------------------------
 
 def page_passes_deterministic_filters(title: str, rules: dict) -> bool:
@@ -455,10 +550,19 @@ def page_passes_deterministic_filters(title: str, rules: dict) -> bool:
     return True
 
 
-def page_passes_llm_filter(title: str, rules: dict, model: str) -> bool:
+def page_passes_llm_filter(
+    title: str,
+    rules: dict,
+    model: str,
+    cache_dir: Optional[Path] = None,
+    project_id: str = "",
+) -> bool:
     """
     If llm_traversal_filter is enabled in `rules`, ask the LLM whether this
     page should be included.  Returns True if the filter is disabled.
+
+    If cache_dir and project_id are provided, the LLM decision is cached on
+    disk and reused on subsequent runs (resumability).
     """
     llm_cfg = rules.get("llm_traversal_filter", {})
     if not llm_cfg.get("enabled", False):
@@ -472,6 +576,23 @@ def page_passes_llm_filter(title: str, rules: dict, model: str) -> bool:
         )
         return True
 
+    # ── Cache check ──────────────────────────────────────────────────────────
+    cache_data: dict = {}
+    cache_path: Optional[Path] = None
+    if cache_dir and project_id:
+        cache_path = _get_cache_path(cache_dir, project_id, title)
+        cache_data = _load_cache(cache_path)
+        if "_llm_traversal" in cache_data:
+            cached = cache_data["_llm_traversal"]
+            decision = cached.get("decision", False)
+            print(
+                f"     ↩  LLM traversal cached ({'YES' if decision else 'NO'}) "
+                f"for '{title}' [model={cached.get('model', '?')}]",
+                flush=True,
+            )
+            return decision
+
+    # ── Fresh LLM call ───────────────────────────────────────────────────────
     include_summary = llm_cfg.get("include_page_summary", True)
     include_cats = llm_cfg.get("include_categories", False)
 
@@ -483,7 +604,7 @@ def page_passes_llm_filter(title: str, rules: dict, model: str) -> bool:
     if include_cats:
         categories = get_page_categories(title)
 
-    return llm_traversal_decision(
+    decision = llm_traversal_decision(
         title=title,
         prompt=prompt,
         model=model,
@@ -493,9 +614,24 @@ def page_passes_llm_filter(title: str, rules: dict, model: str) -> bool:
         categories=categories,
     )
 
+    # ── Write to cache ───────────────────────────────────────────────────────
+    if cache_path is not None:
+        # Preserve any existing extraction data in the cache file
+        cache_data.setdefault("_page_title", title)
+        cache_data.setdefault("_wikipedia_url",
+            "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"))
+        cache_data["_cache_version"] = CACHE_VERSION
+        cache_data["_llm_traversal"] = {
+            "model": model,
+            "decision": decision,
+        }
+        _save_cache(cache_path, cache_data)
+
+    return decision
+
 
 # ---------------------------------------------------------------------------
-# Extraction question evaluation
+# Extraction question evaluation  (cache-aware)
 # ---------------------------------------------------------------------------
 
 def _resolve_source(
@@ -635,7 +771,7 @@ def answer_extraction_question(
 
 
 # ---------------------------------------------------------------------------
-# Per-page record builder
+# Per-page record builder  (cache-aware)
 # ---------------------------------------------------------------------------
 
 def build_page_record(
@@ -643,11 +779,45 @@ def build_page_record(
     questions: list[dict],
     model: str,
     include_metadata: bool = True,
+    cache_dir: Optional[Path] = None,
+    project_id: str = "",
 ) -> dict:
     """
     Fetch data for a single page and build a JSON-serialisable record
     according to the extraction questions definition.
+
+    If cache_dir and project_id are given, already-extracted fields are loaded
+    from the per-page cache file and LLM calls are skipped for those fields.
+    After extraction the full record is written back to the cache.
     """
+    # ── Cache check — is this page already fully extracted? ──────────────────
+    cache_path: Optional[Path] = None
+    cache_data: dict = {}
+    required_field_names = {
+        q.get("field_name") or q.get("label", "unknown") for q in questions
+    }
+
+    if cache_dir and project_id:
+        cache_path = _get_cache_path(cache_dir, project_id, title)
+        cache_data = _load_cache(cache_path)
+        extraction_cache = cache_data.get("_extraction", {})
+        cached_fields = extraction_cache.get("fields", {})
+
+        if required_field_names and required_field_names.issubset(cached_fields.keys()):
+            # All fields are already in the cache — reconstruct the record directly
+            print(f"  ↩  Extraction cached for '{title}' [model={extraction_cache.get('model', '?')}]", flush=True)
+            record: dict = {}
+            if include_metadata:
+                record["_page_title"] = title
+                record["_wikipedia_url"] = (
+                    "https://en.wikipedia.org/wiki/" + title.replace(" ", "_")
+                )
+            for q in questions:
+                fn = q.get("field_name") or q.get("label", "unknown")
+                record[fn] = cached_fields[fn]
+            return record
+
+    # ── Fresh extraction ─────────────────────────────────────────────────────
     print(f"  → Fetching page: {title}", flush=True)
 
     wikitext = get_page_wikitext(title)
@@ -661,7 +831,7 @@ def build_page_record(
             entity = get_wikidata_entity(title)
             break
 
-    record: dict = {}
+    record = {}
 
     if include_metadata:
         record["_page_title"] = title
@@ -669,11 +839,26 @@ def build_page_record(
             "https://en.wikipedia.org/wiki/" + title.replace(" ", "_")
         )
 
+    extracted_fields: dict = {}
     for q in questions:
         field_name = q.get("field_name") or q.get("label", "unknown")
-        record[field_name] = answer_extraction_question(
+        value = answer_extraction_question(
             title, q, wikitext, infobox, entity, model
         )
+        record[field_name] = value
+        extracted_fields[field_name] = value
+
+    # ── Write extraction results to cache ────────────────────────────────────
+    if cache_path is not None:
+        cache_data.setdefault("_page_title", title)
+        cache_data.setdefault("_wikipedia_url",
+            "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"))
+        cache_data["_cache_version"] = CACHE_VERSION
+        cache_data["_extraction"] = {
+            "model": model,
+            "fields": extracted_fields,
+        }
+        _save_cache(cache_path, cache_data)
 
     return record
 
@@ -688,6 +873,8 @@ def run_crawl(
     extraction_questions: list[dict],
     output_path: str,
     model: str,
+    cache_dir: Optional[Path] = None,
+    project_id: str = "",
 ) -> None:
     """
     Full crawl: resolve starting pages → filter links → extract → write JSON.
@@ -698,12 +885,23 @@ def run_crawl(
       [3] Apply deterministic filters, then optional LLM filter
       [4] Extract data from accepted pages
       [5] Write structured JSON output
+
+    Cache / resumability:
+      LLM traversal decisions and extracted field values are cached in
+      json_cache/<project_id>/<page>.json so that interrupted runs can be
+      resumed without repeating expensive LLM API calls.
     """
     max_pages = traversal_rules.get("max_secondary_pages", 200)
     delay = traversal_rules.get("request_delay_seconds", 0.5)
     include_starting_pages = traversal_rules.get("include_starting_pages_in_output", False)
 
     llm_filter_enabled = traversal_rules.get("llm_traversal_filter", {}).get("enabled", False)
+
+    # Announce cache directory in use
+    if cache_dir and project_id:
+        project_cache = cache_dir / project_id
+        project_cache.mkdir(parents=True, exist_ok=True)
+        print(f"  💾  Cache directory: {project_cache}", flush=True)
 
     # ── [1] Resolve starting page titles ──────────────────────────────────────
     starting_titles = [resolve_page_title(p) for p in starting_pages]
@@ -738,14 +936,25 @@ def run_crawl(
             )
             break
 
-        # Step A: cheap deterministic filters
+        # Step A: cheap deterministic filters (never cached — instantaneous)
         if not page_passes_deterministic_filters(link, traversal_rules):
             continue
 
-        # Step B: optional LLM filter (more expensive — called only if A passed)
+        # Step B: optional LLM filter (cache-aware)
         if llm_filter_enabled:
-            print(f"     LLM filter: asking about '{link}'…", flush=True)
-            if not page_passes_llm_filter(link, traversal_rules, model):
+            # Only print the "asking" line if it won't be served from cache
+            cache_path_check = None
+            if cache_dir and project_id:
+                cache_path_check = _get_cache_path(cache_dir, project_id, link)
+                if not (_load_cache(cache_path_check).get("_llm_traversal")):
+                    print(f"     LLM filter: asking about '{link}'…", flush=True)
+            else:
+                print(f"     LLM filter: asking about '{link}'…", flush=True)
+
+            if not page_passes_llm_filter(
+                link, traversal_rules, model,
+                cache_dir=cache_dir, project_id=project_id,
+            ):
                 print(f"     ✗ LLM says NO for '{link}'", flush=True)
                 time.sleep(delay)
                 continue
@@ -762,13 +971,19 @@ def run_crawl(
 
     if include_starting_pages:
         for start_title in starting_titles:
-            rec = build_page_record(start_title, extraction_questions, model)
+            rec = build_page_record(
+                start_title, extraction_questions, model,
+                cache_dir=cache_dir, project_id=project_id,
+            )
             rec["_is_starting_page"] = True
             records.append(rec)
             time.sleep(delay)
 
     for title in accepted:
-        rec = build_page_record(title, extraction_questions, model)
+        rec = build_page_record(
+            title, extraction_questions, model,
+            cache_dir=cache_dir, project_id=project_id,
+        )
         rec["_is_starting_page"] = False
         records.append(rec)
         time.sleep(delay)
@@ -795,6 +1010,7 @@ def run_crawl(
             "model": model,
             "starting_pages": starting_titles,
             "total_records": len(records),
+            "cache_dir": str(cache_dir / project_id) if (cache_dir and project_id) else None,
             "output_schema": output_schema,
         },
         "records": records,
@@ -824,7 +1040,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "page.  The results are written as structured JSON.\n\n"
             "LLM calls use the OpenAI ChatGPT API by default (gpt-4o).  Set\n"
             "OPENAI_API_KEY in your environment (copy .env.example to .env).\n"
-            "Pass --model to switch to any litellm-supported model."
+            "Pass --model to switch to any litellm-supported model.\n\n"
+            "RESUMABILITY: LLM traversal decisions and extracted field values\n"
+            "are cached in json_cache/<project_id>/ so interrupted runs can\n"
+            "be restarted without repeating expensive API calls."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -883,6 +1102,42 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--cache-dir",
+        metavar="CACHE_DIR",
+        default="json_cache",
+        help=(
+            "Root directory for the per-project JSON cache. "
+            "Default: json_cache  (relative to current working directory). "
+            "Each project gets its own sub-directory: <cache-dir>/<project-id>/. "
+            "Pass an empty string or 'none' to disable caching entirely."
+        ),
+    )
+
+    parser.add_argument(
+        "--project-id",
+        metavar="PROJECT_ID",
+        default="",
+        help=(
+            "Identifier for this crawl project.  Used as the sub-directory name "
+            "inside --cache-dir.  Default: derived from the --output filename stem "
+            "(e.g. 'results/dog_breeds.json' → project-id 'dog_breeds'). "
+            "Set explicitly to share a cache across multiple output files, or to "
+            "use a descriptive name."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable the JSON cache entirely for this run.  All LLM calls will be "
+            "made fresh and nothing will be read from or written to disk.  "
+            "Equivalent to passing --cache-dir none."
+        ),
+    )
+
     return parser.parse_args(argv)
 
 
@@ -926,12 +1181,31 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
         sys.exit(1)
 
+    # ── Resolve cache settings ────────────────────────────────────────────────
+    cache_dir: Optional[Path] = None
+    project_id: str = ""
+
+    cache_disabled = (
+        args.no_cache
+        or not args.cache_dir
+        or args.cache_dir.lower() in ("none", "false", "0", "")
+    )
+
+    if not cache_disabled:
+        cache_dir = Path(args.cache_dir)
+        project_id = args.project_id or _derive_project_id(args.output)
+        print(f"  💾  Project cache: {cache_dir / project_id}", flush=True)
+    else:
+        print("  ℹ️   Cache disabled — all LLM calls will be made fresh.", flush=True)
+
     run_crawl(
         starting_pages=args.starting_pages,
         traversal_rules=traversal_rules,
         extraction_questions=extraction_questions,
         output_path=args.output,
         model=args.model,
+        cache_dir=cache_dir,
+        project_id=project_id,
     )
 
 

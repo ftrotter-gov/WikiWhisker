@@ -26,7 +26,7 @@
 
 # There are ~500+ distinct dog breed entries linked from the list page.
 # Set high enough to capture all of them.
-max_secondary_pages: 500
+max_secondary_pages: 50
 
 # Be polite to the Wikipedia API.
 request_delay_seconds: 0.5

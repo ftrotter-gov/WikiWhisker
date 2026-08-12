@@ -167,6 +167,14 @@ pyrightconfig.json
 results/
 output.json
 
+# WikiWhisker — JSON cache (per-project LLM result cache for resumability)
+# The directory structure is tracked via json_cache/.gitkeep but the cache
+# files themselves are local and should not be committed.
+json_cache/**/*.json
+json_cache/**/*.tmp
+# Allow the .gitkeep sentinel so the directory exists in the repo
+!json_cache/.gitkeep
+
 # WikiWhisker — user config files (may contain sensitive prompts/paths)
 # Copy examples/ files into config/ and customise them locally.
 # Commit config/ only if your configs contain no sensitive data.
